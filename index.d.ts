@@ -99,6 +99,12 @@ export interface PdfProps {
      * Supported on Android; iOS can be added later.
      */
     highlightRects?: Array<{ page: number; rect: string }>,
+    /**
+     * Optional. Diagonal-hatch bands drawn on the same PDFKit/pdf-view-anchored overlay as
+     * highlightRects, so they track zoom/pan correctly (unlike a JS-side screen-space overlay).
+     * Each item: { page: number, rect: string } where rect is "left,top,right,bottom" in PDF page coordinates.
+     */
+    skipZoneRects?: Array<{ page: number; rect: string }>,
 }
 
 declare class Pdf extends React.Component<PdfProps, any> {

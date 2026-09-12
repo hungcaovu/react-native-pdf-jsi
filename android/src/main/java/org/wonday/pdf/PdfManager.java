@@ -79,6 +79,11 @@ public class PdfManager extends SimpleViewManager<PdfView> implements RNPDFPdfVi
         pdfView.setHighlightRects(highlightRects);
     }
 
+    @ReactProp(name = "skipZoneRects")
+    public void setSkipZoneRects(PdfView pdfView, ReadableArray skipZoneRects) {
+        pdfView.setSkipZoneRects(skipZoneRects);
+    }
+
     // page start from 1
     @ReactProp(name = "page")
     public void setPage(PdfView pdfView, int page) {

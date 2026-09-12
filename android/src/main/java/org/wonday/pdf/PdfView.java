@@ -121,11 +121,23 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
     private static final int HIGHLIGHT_COLOR = Color.argb(80, 255, 255, 0);
     private final Paint highlightPaint = new Paint();
 
+    /** Header/footer skip-zone bands — same shape/units as highlightRects, drawn as a hatch instead of a solid fill. */
+    private List<HighlightRect> skipZoneRects = new ArrayList<>();
+    private static final int SKIP_ZONE_TINT_COLOR = Color.argb(56, 128, 128, 128);
+    private static final int SKIP_ZONE_HATCH_COLOR = Color.argb(140, 64, 64, 64);
+    private final Paint skipZoneTintPaint = new Paint();
+    private final Paint skipZoneHatchPaint = new Paint();
+
     public PdfView(Context context, AttributeSet set){
         super(context, set);
         ConfigKt.setPdfiumConfig(new Config(new DefaultLogger(), AlreadyClosedBehavior.IGNORE));
         highlightPaint.setColor(HIGHLIGHT_COLOR);
         highlightPaint.setStyle(Paint.Style.FILL);
+        skipZoneTintPaint.setColor(SKIP_ZONE_TINT_COLOR);
+        skipZoneTintPaint.setStyle(Paint.Style.FILL);
+        skipZoneHatchPaint.setColor(SKIP_ZONE_HATCH_COLOR);
+        skipZoneHatchPaint.setStyle(Paint.Style.STROKE);
+        skipZoneHatchPaint.setStrokeWidth(3);
     }
 
     /** Entry for one highlight: page (1-based) and rect in PDF points "left,top,right,bottom". */
@@ -397,7 +409,7 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         lastPageWidth = pageWidth;
         lastPageHeight = pageHeight;
 
-        if (!highlightRects.isEmpty() && pdfId != null) {
+        if ((!highlightRects.isEmpty() || !skipZoneRects.isEmpty()) && pdfId != null) {
             int pageOneBased = displayedPage + 1;
             try {
                 float pdfW = 0, pdfH = 0;
@@ -416,6 +428,20 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
                 if (pdfW > 0 && pdfH > 0) {
                     float scaleX = pageWidth / pdfW;
                     float scaleY = pageHeight / pdfH;
+                    // Skip-zone hatch drawn first (underneath), same page->canvas math as the
+                    // highlight rects below — this is the PDF page's own render canvas (already
+                    // reflecting the current zoom level via pageWidth/pageHeight), so unlike the
+                    // old JS-side screen-space overlay it stays aligned at any zoom/pan.
+                    for (HighlightRect sz : skipZoneRects) {
+                        if (sz.page != pageOneBased) continue;
+                        float left = sz.left * scaleX;
+                        float right = sz.right * scaleX;
+                        float top = sz.top * scaleY;
+                        float bottom = sz.bottom * scaleY;
+                        float canvasTop = pageHeight - top;
+                        float canvasBottom = pageHeight - bottom;
+                        drawSkipZoneHatch(canvas, left, canvasTop, right, canvasBottom);
+                    }
                     for (HighlightRect hr : highlightRects) {
                         if (hr.page != pageOneBased) continue;
                         float left = hr.left * scaleX;
@@ -432,6 +458,20 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
                 showLog("Highlight draw error: " + e.getMessage());
             }
         }
+    }
+
+    /** Translucent tint + diagonal hatch (9px spacing, 3px stroke, 45°), matching the old JS SvgPattern look. */
+    private void drawSkipZoneHatch(Canvas canvas, float left, float top, float right, float bottom) {
+        canvas.save();
+        canvas.clipRect(left, top, right, bottom);
+        canvas.drawRect(left, top, right, bottom, skipZoneTintPaint);
+        canvas.translate((left + right) / 2f, (top + bottom) / 2f);
+        canvas.rotate(45);
+        float diag = (float) Math.hypot(right - left, bottom - top);
+        for (float x = -diag; x <= diag; x += 9) {
+            canvas.drawLine(x, -diag, x, diag, skipZoneHatchPaint);
+        }
+        canvas.restore();
     }
 
     @Override
@@ -565,6 +605,19 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
 
     public void setHighlightRects(ReadableArray arr) {
         highlightRects.clear();
+        parseRectsInto(arr, highlightRects);
+        invalidate();
+        postInvalidate();
+    }
+
+    public void setSkipZoneRects(ReadableArray arr) {
+        skipZoneRects.clear();
+        parseRectsInto(arr, skipZoneRects);
+        invalidate();
+        postInvalidate();
+    }
+
+    private static void parseRectsInto(ReadableArray arr, List<HighlightRect> out) {
         if (arr == null) return;
         for (int i = 0; i < arr.size(); i++) {
             ReadableMap map = arr.getMap(i);
@@ -579,11 +632,9 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
                 float top = Float.parseFloat(parts[1].trim());
                 float right = Float.parseFloat(parts[2].trim());
                 float bottom = Float.parseFloat(parts[3].trim());
-                highlightRects.add(new HighlightRect(page, left, top, right, bottom));
+                out.add(new HighlightRect(page, left, top, right, bottom));
             } catch (NumberFormatException ignored) {}
         }
-        invalidate();
-        postInvalidate();
     }
 
     // page start from 1

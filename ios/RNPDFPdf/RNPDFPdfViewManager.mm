@@ -54,6 +54,7 @@ RCT_EXPORT_VIEW_PROPERTY(onChange, RCTBubblingEventBlock);
 RCT_EXPORT_VIEW_PROPERTY(singlePage, BOOL);
 RCT_EXPORT_VIEW_PROPERTY(pdfId, NSString);
 RCT_EXPORT_VIEW_PROPERTY(highlightRects, NSArray);
+RCT_EXPORT_VIEW_PROPERTY(skipZoneRects, NSArray);
 
 RCT_EXPORT_METHOD(supportPDFKit:(RCTResponseSenderBlock)callback)
 {
