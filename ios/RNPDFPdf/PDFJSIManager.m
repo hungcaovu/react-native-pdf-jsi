@@ -344,23 +344,30 @@ RCT_EXPORT_METHOD(searchTextDirect:(NSString *)pdfId
             NSArray<PDFSelection *> *selections = [doc findString:searchTerm withOptions:NSCaseInsensitiveSearch];
             RCTLogInfo(@"📄 [Search] findString returned %lu selection(s) for '%@'", (unsigned long)selections.count, searchTerm);
             for (PDFSelection *sel in selections) {
-                for (PDFPage *page in sel.pages) {
-                    NSInteger pageIndex1Based = [doc indexForPage:page] + 1;
-                    if (pageIndex1Based < from || pageIndex1Based > to) continue;
-                    
-                    CGRect bounds = [sel boundsForPage:page];
-                    // PDF page coords: origin bottom-left. Serialize as "left,top,right,bottom" (y-up: top > bottom)
-                    CGFloat left = bounds.origin.x;
-                    CGFloat bottom = bounds.origin.y;
-                    CGFloat right = bounds.origin.x + bounds.size.width;
-                    CGFloat top = bounds.origin.y + bounds.size.height;
-                    NSString *rectStr = [NSString stringWithFormat:@"%g,%g,%g,%g", left, top, right, bottom];
-                    
-                    [out addObject:@{
-                        @"page": @(pageIndex1Based),
-                        @"text": sel.string ?: @"",
-                        @"rect": rectStr
-                    }];
+                // A match that wraps multiple visual lines needs one rect per line —
+                // `boundsForPage:` on the whole multi-line selection is unreliable in PDFKit
+                // (it can collapse to just the first line's bounds), so split into per-line
+                // selections first and emit one rect per line, matching how the text actually
+                // renders on the page.
+                for (PDFSelection *lineSel in [sel selectionsByLine]) {
+                    for (PDFPage *page in lineSel.pages) {
+                        NSInteger pageIndex1Based = [doc indexForPage:page] + 1;
+                        if (pageIndex1Based < from || pageIndex1Based > to) continue;
+
+                        CGRect bounds = [lineSel boundsForPage:page];
+                        // PDF page coords: origin bottom-left. Serialize as "left,top,right,bottom" (y-up: top > bottom)
+                        CGFloat left = bounds.origin.x;
+                        CGFloat bottom = bounds.origin.y;
+                        CGFloat right = bounds.origin.x + bounds.size.width;
+                        CGFloat top = bounds.origin.y + bounds.size.height;
+                        NSString *rectStr = [NSString stringWithFormat:@"%g,%g,%g,%g", left, top, right, bottom];
+
+                        [out addObject:@{
+                            @"page": @(pageIndex1Based),
+                            @"text": lineSel.string ?: @"",
+                            @"rect": rectStr
+                        }];
+                    }
                 }
             }
             
@@ -441,14 +448,18 @@ RCT_EXPORT_METHOD(searchTextBatchDirect:(NSString *)pdfId
                     for (NSString *candidate in candidates) {
                         if (!candidate.length) continue;
                         NSArray<PDFSelection *> *selections = [doc findString:candidate withOptions:NSCaseInsensitiveSearch];
+                        // Same per-line split as searchTextDirect above — a multi-line match
+                        // needs one rect per visual line, not one union rect for the whole match.
                         for (PDFSelection *sel in selections) {
-                            for (PDFPage *pdfPage in sel.pages) {
-                                if (([doc indexForPage:pdfPage] + 1) != page) continue;
-                                CGRect bounds = [sel boundsForPage:pdfPage];
-                                NSString *rectStr = [NSString stringWithFormat:@"%g,%g,%g,%g",
-                                    bounds.origin.x, bounds.origin.y + bounds.size.height,
-                                    bounds.origin.x + bounds.size.width, bounds.origin.y];
-                                [rects addObject:rectStr];
+                            for (PDFSelection *lineSel in [sel selectionsByLine]) {
+                                for (PDFPage *pdfPage in lineSel.pages) {
+                                    if (([doc indexForPage:pdfPage] + 1) != page) continue;
+                                    CGRect bounds = [lineSel boundsForPage:pdfPage];
+                                    NSString *rectStr = [NSString stringWithFormat:@"%g,%g,%g,%g",
+                                        bounds.origin.x, bounds.origin.y + bounds.size.height,
+                                        bounds.origin.x + bounds.size.width, bounds.origin.y];
+                                    [rects addObject:rectStr];
+                                }
                             }
                         }
                         if (rects.count > 0) break;

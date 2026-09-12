@@ -341,29 +341,34 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
                             int end = Math.min(idx + searchTerm.length(), text.length());
                             int len = end - idx;
                             String snippet = text.substring(idx, end);
-                            WritableMap item = Arguments.createMap();
-                            item.putInt("page", pageIndex);
-                            item.putString("text", snippet);
-                            String rectStr = "{}";
+                            // A match that wraps multiple visual lines has one Pdfium rect per
+                            // line (rectCount > 1) — emit one result item per rect instead of
+                            // only the first, so multi-line matches highlight their full span.
                             try {
                                 int rectCount = textPage.textPageCountRects(idx, len);
                                 if (rectCount > 0) {
-                                    RectF first = textPage.textPageGetRect(0);
-                                    if (first != null) {
-                                        rectStr = first.left + "," + first.top + "," + first.right + "," + first.bottom;
+                                    for (int r = 0; r < rectCount; r++) {
+                                        RectF rf = textPage.textPageGetRect(r);
+                                        if (rf == null) continue;
+                                        WritableMap item = Arguments.createMap();
+                                        item.putInt("page", pageIndex);
+                                        item.putString("text", snippet);
+                                        item.putString("rect", rf.left + "," + rf.top + "," + rf.right + "," + rf.bottom);
+                                        out.pushMap(item);
                                     }
-                                }
-                                if ("{}".equals(rectStr)) {
+                                } else {
                                     RectF charBox = textPage.textPageGetCharBox(idx);
                                     if (charBox != null) {
-                                        rectStr = charBox.left + "," + charBox.top + "," + charBox.right + "," + charBox.bottom;
+                                        WritableMap item = Arguments.createMap();
+                                        item.putInt("page", pageIndex);
+                                        item.putString("text", snippet);
+                                        item.putString("rect", charBox.left + "," + charBox.top + "," + charBox.right + "," + charBox.bottom);
+                                        out.pushMap(item);
                                     }
                                 }
                             } catch (Exception e) {
                                 Log.d(TAG, "Rect lookup for match at " + idx + ": " + e.getMessage());
                             }
-                            item.putString("rect", rectStr);
-                            out.pushMap(item);
                             idx = end;
                         }
                     } finally {
@@ -471,14 +476,17 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
                                         int end = Math.min(idx + candidate.length(), pageText.length());
                                         int len = end - idx;
                                         try {
+                                            // Same per-line fix as searchInPdf above: a multi-line
+                                            // match has one rect per line — collect them all.
                                             int rectCount = textPage.textPageCountRects(idx, len);
                                             if (rectCount > 0) {
-                                                RectF first = textPage.textPageGetRect(0);
-                                                if (first != null) {
-                                                    rects.pushString(first.left + "," + first.top + "," + first.right + "," + first.bottom);
+                                                for (int r = 0; r < rectCount; r++) {
+                                                    RectF rf = textPage.textPageGetRect(r);
+                                                    if (rf != null) {
+                                                        rects.pushString(rf.left + "," + rf.top + "," + rf.right + "," + rf.bottom);
+                                                    }
                                                 }
-                                            }
-                                            if (rects.size() == 0) {
+                                            } else {
                                                 RectF charBox = textPage.textPageGetCharBox(idx);
                                                 if (charBox != null) {
                                                     rects.pushString(charBox.left + "," + charBox.top + "," + charBox.right + "," + charBox.bottom);
