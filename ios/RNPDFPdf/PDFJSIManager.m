@@ -39,7 +39,7 @@ RCT_EXPORT_MODULE(PDFJSIManager);
 }
 
 - (NSArray<NSString *> *)supportedEvents {
-    return @[@"PDFJSIEvent"];
+    return @[@"PDFJSIEvent", @"PDFTextSearchProgress"];
 }
 
 #pragma mark - JSI Initialization
@@ -306,8 +306,7 @@ RCT_EXPORT_METHOD(searchTextDirect:(NSString *)pdfId
                 resolve(@[]);
                 return;
             }
-            NSURL *fileURL = [NSURL fileURLWithPath:path];
-            PDFDocument *doc = [[PDFDocument alloc] initWithURL:fileURL];
+            PDFDocument *doc = [SearchRegistry documentForPdfId:pdfId path:path];
             if (!doc || doc.pageCount == 0) {
                 RCTLogWarn(@"❌ [Search] PDFDocument init failed or empty: doc=%p pageCount=%lu", (__bridge void *)doc, (unsigned long)doc.pageCount);
                 resolve(@[]);
@@ -360,10 +359,101 @@ RCT_EXPORT_METHOD(searchTextDirect:(NSString *)pdfId
     });
 }
 
+/**
+ * Batched sibling of `searchTextDirect`: resolves rects for many search terms in a single
+ * bridge round-trip against one cached, already-open PDFDocument (see SearchRegistry), instead
+ * of one bridge call + full document open/parse per term. Used by JS to precompute per-sentence
+ * highlight rects at import time without paying an open+parse cost per sentence.
+ *
+ * `terms`: NSArray of NSDictionary, each: { id: string, page: number (1-based),
+ *          candidates: [string, ...] } — candidates tried in order, first match wins.
+ * Resolves: NSArray of { id: string, rects: [rectStr, ...] }, omitting terms with no match.
+ * Emits "PDFTextSearchProgress" with { done, total } every ~20 terms so JS can show progress.
+ */
+RCT_EXPORT_METHOD(searchTextBatchDirect:(NSString *)pdfId
+                  terms:(NSArray *)terms
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+
+    if (!_isJSIInitialized) {
+        reject(@"JSI_NOT_INITIALIZED", @"JSI is not initialized", nil);
+        return;
+    }
+    if (!terms.count) {
+        resolve(@[]);
+        return;
+    }
+
+    dispatch_async(_backgroundQueue, ^{
+        @try {
+            NSString *path = [SearchRegistry pathForPdfId:pdfId];
+            if (!path.length || [path hasPrefix:@"http://"] || [path hasPrefix:@"https://"]) {
+                resolve(@[]);
+                return;
+            }
+            if ([path hasPrefix:@"file://"]) {
+                path = [path substringFromIndex:7];
+            }
+            if (![[NSFileManager defaultManager] isReadableFileAtPath:path]) {
+                resolve(@[]);
+                return;
+            }
+            PDFDocument *doc = [SearchRegistry documentForPdfId:pdfId path:path];
+            if (!doc || doc.pageCount == 0) {
+                resolve(@[]);
+                return;
+            }
+
+            NSMutableArray *out = [NSMutableArray arrayWithCapacity:terms.count];
+            NSUInteger total = terms.count;
+            NSUInteger done = 0;
+
+            for (NSDictionary *term in terms) {
+                NSString *termId = term[@"id"];
+                NSInteger page = [term[@"page"] integerValue];
+                NSArray *candidates = term[@"candidates"];
+                NSMutableArray<NSString *> *rects = [NSMutableArray array];
+
+                if (termId.length && page >= 1 && page <= (NSInteger)doc.pageCount && candidates.count) {
+                    for (NSString *candidate in candidates) {
+                        if (!candidate.length) continue;
+                        NSArray<PDFSelection *> *selections = [doc findString:candidate withOptions:NSCaseInsensitiveSearch];
+                        for (PDFSelection *sel in selections) {
+                            for (PDFPage *pdfPage in sel.pages) {
+                                if (([doc indexForPage:pdfPage] + 1) != page) continue;
+                                CGRect bounds = [sel boundsForPage:pdfPage];
+                                NSString *rectStr = [NSString stringWithFormat:@"%g,%g,%g,%g",
+                                    bounds.origin.x, bounds.origin.y + bounds.size.height,
+                                    bounds.origin.x + bounds.size.width, bounds.origin.y];
+                                [rects addObject:rectStr];
+                            }
+                        }
+                        if (rects.count > 0) break;
+                    }
+                }
+
+                if (rects.count > 0) {
+                    [out addObject:@{ @"id": termId, @"rects": rects }];
+                }
+
+                done += 1;
+                if (done % 20 == 0 || done == total) {
+                    [self sendEventWithName:@"PDFTextSearchProgress" body:@{ @"done": @(done), @"total": @(total) }];
+                }
+            }
+
+            resolve(out);
+        } @catch (NSException *exception) {
+            RCTLogError(@"❌ Error batch-searching text via JSI: %@", exception.reason);
+            reject(@"SEARCH_ERROR", exception.reason, nil);
+        }
+    });
+}
+
 RCT_EXPORT_METHOD(getPerformanceMetrics:(NSString *)pdfId
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
-    
+
     if (!_isJSIInitialized) {
         reject(@"JSI_NOT_INITIALIZED", @"JSI is not initialized", nil);
         return;

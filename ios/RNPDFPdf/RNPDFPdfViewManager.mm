@@ -192,6 +192,19 @@ RCT_EXPORT_METHOD(searchTextDirect:(NSString *)pdfId
     }
 }
 
+RCT_EXPORT_METHOD(searchTextBatchDirect:(NSString *)pdfId
+                  terms:(NSArray *)terms
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+    PDFJSIManager *jsiManager = [self.bridge moduleForClass:[PDFJSIManager class]];
+    if (jsiManager) {
+        [jsiManager searchTextBatchDirect:pdfId terms:terms resolver:resolve rejecter:reject];
+    } else {
+        reject(@"JSI_NOT_AVAILABLE", @"PDFJSIManager not available", nil);
+    }
+}
+
 RCT_EXPORT_METHOD(getPerformanceMetricsDirect:(NSString *)pdfId
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)

@@ -502,6 +502,32 @@ export function searchTextDirect(
     endPage: number
 ): Promise<PDFSearchResultItem[]>;
 
+export interface PDFSearchBatchTerm {
+    /** Caller-defined id (e.g. sentence id) echoed back on a match. */
+    id: string;
+    /** 1-based page number the term is expected on. */
+    page: number;
+    /** Candidate strings tried in order; the first one that matches wins. */
+    candidates: string[];
+}
+
+export interface PDFSearchBatchResultItem {
+    id: string;
+    rects: string[];
+}
+
+/**
+ * Batched sibling of searchTextDirect: resolves rects for many terms against one cached,
+ * already-open document instead of one open+parse per term. Use for bulk precompute (e.g. one
+ * call per document instead of one call per sentence). Only terms with a match are returned.
+ * Progress is emitted as "PDFTextSearchProgress" ({ done, total }); pass `onProgress` to receive it.
+ */
+export function searchTextBatchDirect(
+    pdfId: string,
+    terms: PDFSearchBatchTerm[],
+    options?: { onProgress?: (done: number, total: number) => void }
+): Promise<PDFSearchBatchResultItem[]>;
+
 // ========================================
 // PDFText (extraction + optional OCR)
 // ========================================

@@ -281,22 +281,8 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
 
     private WritableArray searchInPdf(String pdfId, String path, String searchTerm, int startPage, int endPage) {
         WritableArray out = Arguments.createArray();
-        ParcelFileDescriptor pfd = null;
-        PdfDocument doc = null;
         try {
-            if (path.startsWith("content://")) {
-                pfd = getReactApplicationContext().getContentResolver()
-                    .openFileDescriptor(Uri.parse(path), "r");
-            } else {
-                File file = new File(path);
-                if (!file.exists() || !file.canRead()) {
-                    return out;
-                }
-                pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY);
-            }
-            if (pfd == null) return out;
-            PdfiumCore core = new PdfiumCore();
-            doc = core.newDocument(pfd);
+            PdfDocument doc = SearchRegistry.getOrOpenDocument(pdfId, path, getReactApplicationContext());
             int pageCount = doc.getPageCount();
             int from = Math.max(1, startPage);
             int to = Math.min(endPage, pageCount);
@@ -363,19 +349,151 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
             Log.e(TAG, "Search IO error", e);
         } catch (Exception e) {
             Log.e(TAG, "Search error", e);
-        } finally {
-            if (doc != null) {
-                try {
-                    doc.close();
-                } catch (Exception ignored) {}
-            }
-            if (pfd != null) {
-                try {
-                    pfd.close();
-                } catch (IOException ignored) {}
-            }
         }
+        // Note: the PdfDocument is owned by SearchRegistry's cache now — do not close it here.
         return out;
+    }
+
+    /**
+     * Batched sibling of searchTextDirect: resolves rects for many terms in one bridge call,
+     * against one cached, already-open document (SearchRegistry), instead of one bridge call +
+     * full document open/parse per term. Terms on the same page share one opened PdfPage/
+     * PdfTextPage instead of reopening per term.
+     *
+     * terms: ReadableArray of maps, each: { id: string, page: number (1-based),
+     *        candidates: [string, ...] } — candidates tried in order, first match wins.
+     * Resolves: WritableArray of { id: string, rects: [rectStr, ...] }, omitting no-match terms.
+     * Emits "PDFTextSearchProgress" ({ done, total }) every ~20 terms.
+     */
+    @ReactMethod
+    public void searchTextBatchDirect(String pdfId, ReadableArray terms, Promise promise) {
+        if (!isJSIInitialized) {
+            promise.reject("JSI_NOT_INITIALIZED", "JSI is not initialized");
+            return;
+        }
+        if (terms == null || terms.size() == 0) {
+            promise.resolve(Arguments.createArray());
+            return;
+        }
+        backgroundExecutor.execute(() -> {
+            WritableArray out = Arguments.createArray();
+            try {
+                String path = SearchRegistry.getPath(pdfId);
+                if (path == null || path.isEmpty()) {
+                    promise.resolve(out);
+                    return;
+                }
+                PdfDocument doc = SearchRegistry.getOrOpenDocument(pdfId, path, getReactApplicationContext());
+                int pageCount = doc.getPageCount();
+                int total = terms.size();
+
+                // Group term indices by page so each page's PdfTextPage is opened once.
+                java.util.Map<Integer, java.util.List<Integer>> indicesByPage = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < total; i++) {
+                    ReadableMap term = terms.getMap(i);
+                    int page = term != null ? term.getInt("page") : -1;
+                    indicesByPage.computeIfAbsent(page, k -> new java.util.ArrayList<>()).add(i);
+                }
+
+                int done = 0;
+                for (java.util.Map.Entry<Integer, java.util.List<Integer>> entry : indicesByPage.entrySet()) {
+                    int page = entry.getKey();
+                    int zeroBased = page - 1;
+                    if (page < 1 || zeroBased >= pageCount) {
+                        done += entry.getValue().size();
+                        continue;
+                    }
+                    PdfPage pdfPage = doc.openPage(zeroBased);
+                    if (pdfPage == null) {
+                        done += entry.getValue().size();
+                        continue;
+                    }
+                    try {
+                        PdfTextPage textPage = pdfPage.openTextPage();
+                        if (textPage == null) {
+                            done += entry.getValue().size();
+                            continue;
+                        }
+                        try {
+                            int chars = textPage.textPageCountChars();
+                            String pageText = chars > 0 ? textPage.textPageGetText(0, chars) : null;
+                            String pageTextLower = pageText != null ? pageText.toLowerCase() : null;
+
+                            for (int i : entry.getValue()) {
+                                ReadableMap term = terms.getMap(i);
+                                String termId = term != null ? term.getString("id") : null;
+                                ReadableArray candidates = term != null ? term.getArray("candidates") : null;
+                                WritableArray rects = Arguments.createArray();
+
+                                if (termId != null && pageTextLower != null && candidates != null) {
+                                    for (int c = 0; c < candidates.size() && rects.size() == 0; c++) {
+                                        String candidate = candidates.getString(c);
+                                        if (candidate == null || candidate.isEmpty()) continue;
+                                        int idx = pageTextLower.indexOf(candidate.toLowerCase());
+                                        if (idx < 0) continue;
+                                        int end = Math.min(idx + candidate.length(), pageText.length());
+                                        int len = end - idx;
+                                        try {
+                                            int rectCount = textPage.textPageCountRects(idx, len);
+                                            if (rectCount > 0) {
+                                                RectF first = textPage.textPageGetRect(0);
+                                                if (first != null) {
+                                                    rects.pushString(first.left + "," + first.top + "," + first.right + "," + first.bottom);
+                                                }
+                                            }
+                                            if (rects.size() == 0) {
+                                                RectF charBox = textPage.textPageGetCharBox(idx);
+                                                if (charBox != null) {
+                                                    rects.pushString(charBox.left + "," + charBox.top + "," + charBox.right + "," + charBox.bottom);
+                                                }
+                                            }
+                                        } catch (Exception e) {
+                                            Log.d(TAG, "Rect lookup failed for term " + termId + ": " + e.getMessage());
+                                        }
+                                    }
+                                }
+
+                                if (rects.size() > 0) {
+                                    WritableMap item = Arguments.createMap();
+                                    item.putString("id", termId);
+                                    item.putArray("rects", rects);
+                                    out.pushMap(item);
+                                }
+
+                                done += 1;
+                                if (done % 20 == 0 || done == total) {
+                                    WritableMap progress = Arguments.createMap();
+                                    progress.putInt("done", done);
+                                    progress.putInt("total", total);
+                                    getReactApplicationContext()
+                                        .getJSModule(com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                                        .emit("PDFTextSearchProgress", progress);
+                                }
+                            }
+                        } finally {
+                            textPage.close();
+                        }
+                    } finally {
+                        pdfPage.close();
+                    }
+                }
+
+                promise.resolve(out);
+            } catch (Exception e) {
+                Log.e(TAG, "Error batch-searching text via JSI", e);
+                promise.reject("SEARCH_ERROR", e.getMessage());
+            }
+        });
+    }
+
+    @ReactMethod
+    public void addListener(String eventName) {
+        // Required boilerplate for NativeEventEmitter — actual (un)subscription lives on the JS side.
+    }
+
+    @ReactMethod
+    public void removeListeners(Integer count) {
+        // Required boilerplate for NativeEventEmitter.
     }
     
     /**

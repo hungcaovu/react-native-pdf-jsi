@@ -10,6 +10,20 @@ import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
 
 const { PDFJSIManager: PDFJSIManagerNative, EnhancedPdfJSIBridge, RNPDFPdfViewManager } = NativeModules;
 
+// Progress events for searchTextBatchDirect ("PDFTextSearchProgress" { done, total }) are emitted
+// by the native PDFJSIManager module on both platforms — see CacheManager.js for the same pattern.
+let searchEventEmitter = null;
+if (PDFJSIManagerNative) {
+    try {
+        if (typeof PDFJSIManagerNative.addListener === 'function' || typeof PDFJSIManagerNative.removeListeners === 'function') {
+            searchEventEmitter = new NativeEventEmitter(PDFJSIManagerNative);
+        }
+    } catch (error) {
+        console.warn('[PDFJSI] Failed to create NativeEventEmitter:', error);
+        searchEventEmitter = null;
+    }
+}
+
 /**
  * OPTIMIZATION: Performance timer with lazy evaluation (30% less overhead)
  */
@@ -413,12 +427,68 @@ class PDFJSIManager {
             
         } catch (error) {
             const searchTime = timer.end();
-            
+
             console.error(`📱 PDFJSI: Error searching text in ${searchTime.toFixed(2)}ms:`, error);
             throw error;
         }
     }
-    
+
+    /**
+     * Resolve rects for many search terms in one native call, reusing one cached/already-open
+     * PDF document instead of paying a full open+parse per term (what calling searchTextDirect
+     * in a loop costs). Intended for bulk precompute (e.g. one call per document instead of one
+     * call per sentence).
+     * @param {string} pdfId - PDF identifier (must already be registered via registerPathForSearch)
+     * @param {Array<{id: string, page: number, candidates: string[]}>} terms - candidates tried
+     *        in order per term, first match wins. `page` is 1-based.
+     * @param {{ onProgress?: (done: number, total: number) => void }} [options]
+     * @returns {Promise<Array<{id: string, rects: string[]}>>} entries for terms that matched
+     */
+    async searchTextBatchDirect(pdfId, terms, options = {}) {
+        if (!this.isJSIAvailable) {
+            throw new Error('JSI not available - falling back to bridge mode');
+        }
+        if (!terms || terms.length === 0) {
+            return [];
+        }
+
+        const { onProgress } = options;
+        let progressSubscription;
+        if (onProgress && searchEventEmitter) {
+            progressSubscription = searchEventEmitter.addListener('PDFTextSearchProgress', (event) => {
+                onProgress(event.done, event.total);
+            });
+        }
+
+        const timer = new PerformanceTimer().start();
+        try {
+            let results;
+            if (Platform.OS === 'android') {
+                results = await PDFJSIManagerNative.searchTextBatchDirect(pdfId, terms);
+            } else if (Platform.OS === 'ios') {
+                results = await RNPDFPdfViewManager.searchTextBatchDirect(pdfId, terms);
+            } else {
+                throw new Error(`Platform ${Platform.OS} not supported`);
+            }
+
+            const searchTime = timer.end();
+            this.trackPerformance('searchTextBatchDirect', searchTime, {
+                pdfId,
+                termCount: terms.length,
+                matchedCount: results.length
+            });
+
+            return results;
+        } catch (error) {
+            console.error('📱 PDFJSI: Error batch-searching text:', error);
+            throw error;
+        } finally {
+            if (progressSubscription) {
+                progressSubscription.remove();
+            }
+        }
+    }
+
     /**
      * Get performance metrics via JSI
      * @param {string} pdfId - PDF identifier
@@ -853,6 +923,7 @@ export const {
     clearCacheDirect,
     optimizeMemory,
     searchTextDirect,
+    searchTextBatchDirect,
     getPerformanceMetrics,
     setRenderQuality,
     getJSIStats,

@@ -28,7 +28,7 @@ import ReactNativeBlobUtil from 'react-native-blob-util'
 import {ViewPropTypes} from 'deprecated-react-native-prop-types';
 const SHA1 = require('crypto-js/sha1');
 import PdfView from './PdfView';
-import PDFJSI, { searchTextDirect } from './src/PDFJSI';
+import PDFJSI, { searchTextDirect, searchTextBatchDirect } from './src/PDFJSI';
 
 export default class Pdf extends Component {
 
@@ -810,7 +810,7 @@ export {
 // ========================================
 // Programmatic search and JSI API (fix #24)
 // ========================================
-export { searchTextDirect, PDFJSI };
+export { searchTextDirect, searchTextBatchDirect, PDFJSI };
 
 // ========================================
 // TIER 3: Pre-built UI Components

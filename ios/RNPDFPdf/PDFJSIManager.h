@@ -50,6 +50,11 @@
                   endPage:(NSInteger)endPage
                  resolver:(RCTPromiseResolveBlock)resolve
                  rejecter:(RCTPromiseRejectBlock)reject;
+
+ - (void)searchTextBatchDirect:(NSString *)pdfId
+                          terms:(NSArray *)terms
+                       resolver:(RCTPromiseResolveBlock)resolve
+                       rejecter:(RCTPromiseRejectBlock)reject;
  
  - (void)getPerformanceMetrics:(NSString *)pdfId
                       resolver:(RCTPromiseResolveBlock)resolve

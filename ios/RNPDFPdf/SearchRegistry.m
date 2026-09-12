@@ -7,12 +7,16 @@
 
 static NSMutableDictionary<NSString *, NSString *> *_pathByPdfId;
 static NSMutableDictionary<NSString *, NSValue *> *_pageSizeByKey; // key = "pdfId_pageIndex", value = NSValue with CGSize
+static NSMutableDictionary<NSString *, PDFDocument *> *_documentByPdfId;
+static NSMutableDictionary<NSString *, NSString *> *_documentPathByPdfId; // path the cached document was opened with
 static dispatch_queue_t _queue;
 
 + (void)initialize {
     if (self == [SearchRegistry class]) {
         _pathByPdfId = [NSMutableDictionary new];
         _pageSizeByKey = [NSMutableDictionary new];
+        _documentByPdfId = [NSMutableDictionary new];
+        _documentPathByPdfId = [NSMutableDictionary new];
         _queue = dispatch_queue_create("com.rnpdf.searchregistry", DISPATCH_QUEUE_SERIAL);
     }
 }
@@ -28,11 +32,33 @@ static dispatch_queue_t _queue;
     if (!pdfId.length) return;
     dispatch_sync(_queue, ^{
         [_pathByPdfId removeObjectForKey:pdfId];
+        [_documentByPdfId removeObjectForKey:pdfId];
+        [_documentPathByPdfId removeObjectForKey:pdfId];
         NSString *prefix = [pdfId stringByAppendingString:@"_"];
         NSArray *keysToRemove = [_pageSizeByKey.allKeys filteredArrayUsingPredicate:
             [NSPredicate predicateWithBlock:^BOOL(NSString *key, id _) { return [key hasPrefix:prefix]; }]];
         [_pageSizeByKey removeObjectsForKeys:keysToRemove];
     });
+}
+
++ (nullable PDFDocument *)documentForPdfId:(NSString *)pdfId path:(NSString *)path {
+    if (!pdfId.length || !path.length) return nil;
+    __block PDFDocument *doc = nil;
+    dispatch_sync(_queue, ^{
+        PDFDocument *cached = _documentByPdfId[pdfId];
+        NSString *cachedPath = _documentPathByPdfId[pdfId];
+        if (cached && [cachedPath isEqualToString:path]) {
+            doc = cached;
+            return;
+        }
+        PDFDocument *fresh = [[PDFDocument alloc] initWithURL:[NSURL fileURLWithPath:path]];
+        if (fresh) {
+            _documentByPdfId[pdfId] = fresh;
+            _documentPathByPdfId[pdfId] = path;
+        }
+        doc = fresh;
+    });
+    return doc;
 }
 
 + (NSString *)pathForPdfId:(NSString *)pdfId {
