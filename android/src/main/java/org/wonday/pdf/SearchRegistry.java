@@ -12,6 +12,7 @@ import android.os.ParcelFileDescriptor;
 import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import io.legere.pdfiumandroid.PdfDocument;
 import io.legere.pdfiumandroid.PdfiumCore;
@@ -34,6 +35,20 @@ public final class SearchRegistry {
         }
     }
     private static final ConcurrentHashMap<String, DocHolder> docByPdfId = new ConcurrentHashMap<>();
+
+    /**
+     * Per-pdfId lock guarding "close" against "in-flight page/text access" on the cached
+     * document: Pdfium's native handle is invalidated by close() immediately, unlike an
+     * Objective-C object under ARC, so a close() racing a search's open-page/read-text/close-page
+     * sequence on another thread (e.g. a view unmounting mid-search) is a use-after-free, not
+     * just a stale reference. Searches hold the read lock for that whole sequence (see
+     * PDFJSIManager); closeDocument holds the write lock while it actually closes the handle.
+     */
+    private static final ConcurrentHashMap<String, ReentrantReadWriteLock> lockByPdfId = new ConcurrentHashMap<>();
+
+    public static ReentrantReadWriteLock lockFor(String pdfId) {
+        return lockByPdfId.computeIfAbsent(pdfId, k -> new ReentrantReadWriteLock());
+    }
 
     public static void registerPath(String pdfId, String path) {
         if (pdfId != null && !pdfId.isEmpty() && path != null && !path.isEmpty()) {
@@ -83,14 +98,23 @@ public final class SearchRegistry {
     }
 
     private static synchronized void closeDocument(String pdfId) {
-        DocHolder holder = docByPdfId.remove(pdfId);
-        if (holder != null) {
-            try {
-                holder.doc.close();
-            } catch (Exception ignored) {}
-            try {
-                holder.pfd.close();
-            } catch (Exception ignored) {}
+        ReentrantReadWriteLock.WriteLock writeLock = lockFor(pdfId).writeLock();
+        writeLock.lock();
+        try {
+            DocHolder holder = docByPdfId.remove(pdfId);
+            if (holder != null) {
+                try {
+                    holder.doc.close();
+                } catch (Exception ignored) {}
+                try {
+                    holder.pfd.close();
+                } catch (Exception ignored) {}
+            }
+        } finally {
+            writeLock.unlock();
+            // Note: the lock instance itself is kept (not removed) — a reader that already holds
+            // a reference to it (about to call readLock().lock()) must keep serializing against
+            // this same lock object, not a freshly-created one, for the guarantee to hold.
         }
     }
 

@@ -44,6 +44,11 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
     private static final String TAG = "PDFJSI";
     
     private ExecutorService backgroundExecutor;
+    // searchTextDirect/searchTextBatchDirect share a cached, mutable Pdfium document per pdfId
+    // (SearchRegistry) — Pdfium does not support concurrent access to one document handle from
+    // multiple threads, so all search calls (any pdfId) run one at a time here instead of on the
+    // 2-thread backgroundExecutor pool used by unrelated render/cache methods.
+    private ExecutorService searchExecutor;
     private boolean isJSIInitialized = false;
     
     // Load native library
@@ -59,7 +64,8 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
     public PDFJSIManager(ReactApplicationContext reactContext) {
         super(reactContext);
         this.backgroundExecutor = Executors.newFixedThreadPool(2);
-        
+        this.searchExecutor = Executors.newSingleThreadExecutor();
+
         Log.d(TAG, "PDFJSIManager: Initializing high-performance PDF JSI manager");
         initializeJSI(reactContext);
     }
@@ -248,6 +254,22 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
     }
     
     /**
+     * Drops the cached opened document (if any) and path for pdfId. Callers that register a
+     * pdfId headlessly without ever mounting a Pdf view for it (e.g. import-time highlight-rect
+     * precompute) must call this when done, or the opened PdfDocument + its file descriptor stay
+     * cached for the lifetime of the process. A later Pdf view mount for the same pdfId
+     * re-registers (and re-opens) independently, so this is always safe to call once a headless
+     * caller is finished.
+     */
+    @ReactMethod
+    public void unregisterPathForSearch(String pdfId, Promise promise) {
+        if (pdfId != null && !pdfId.isEmpty()) {
+            SearchRegistry.unregisterPath(pdfId);
+        }
+        promise.resolve(true);
+    }
+
+    /**
      * Search text directly via JSI.
      * Uses SearchRegistry to get path for pdfId, then io.legere PdfiumCore to extract text and find matches.
      */
@@ -261,7 +283,7 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
             promise.resolve(Arguments.createArray());
             return;
         }
-        backgroundExecutor.execute(() -> {
+        searchExecutor.execute(() -> {
             try {
                 Log.d(TAG, "Searching text via JSI: '" + searchTerm + "' in pages " + startPage + "-" + endPage);
                 String path = SearchRegistry.getPath(pdfId);
@@ -283,6 +305,12 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
         WritableArray out = Arguments.createArray();
         try {
             PdfDocument doc = SearchRegistry.getOrOpenDocument(pdfId, path, getReactApplicationContext());
+            // Held for the whole open-page/read-text/close-page sequence below so a concurrent
+            // unregisterPath (e.g. a PdfView unmounting) can't close() this same native document
+            // out from under us mid-search — see SearchRegistry.lockFor.
+            java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock readLock = SearchRegistry.lockFor(pdfId).readLock();
+            readLock.lock();
+            try {
             int pageCount = doc.getPageCount();
             int from = Math.max(1, startPage);
             int to = Math.min(endPage, pageCount);
@@ -345,6 +373,9 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
                     page.close();
                 }
             }
+            } finally {
+                readLock.unlock();
+            }
         } catch (IOException e) {
             Log.e(TAG, "Search IO error", e);
         } catch (Exception e) {
@@ -375,7 +406,7 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
             promise.resolve(Arguments.createArray());
             return;
         }
-        backgroundExecutor.execute(() -> {
+        searchExecutor.execute(() -> {
             WritableArray out = Arguments.createArray();
             try {
                 String path = SearchRegistry.getPath(pdfId);
@@ -384,6 +415,12 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
                     return;
                 }
                 PdfDocument doc = SearchRegistry.getOrOpenDocument(pdfId, path, getReactApplicationContext());
+                // Held for the whole open-page/read-text/close-page sequence below so a
+                // concurrent unregisterPath can't close() this same native document out from
+                // under us mid-search — see SearchRegistry.lockFor.
+                java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock readLock = SearchRegistry.lockFor(pdfId).readLock();
+                readLock.lock();
+                try {
                 int pageCount = doc.getPageCount();
                 int total = terms.size();
 
@@ -477,6 +514,9 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
                         pdfPage.close();
                     }
                 }
+                } finally {
+                    readLock.unlock();
+                }
 
                 promise.resolve(out);
             } catch (Exception e) {
@@ -544,6 +584,9 @@ public class PDFJSIManager extends ReactContextBaseJavaModule {
     public void onCatalystInstanceDestroy() {
         super.onCatalystInstanceDestroy();
         
+        if (searchExecutor != null && !searchExecutor.isShutdown()) {
+            searchExecutor.shutdown();
+        }
         if (backgroundExecutor != null && !backgroundExecutor.isShutdown()) {
             backgroundExecutor.shutdown();
         }

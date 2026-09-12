@@ -51,6 +51,10 @@
                  resolver:(RCTPromiseResolveBlock)resolve
                  rejecter:(RCTPromiseRejectBlock)reject;
 
+ - (void)unregisterPathForSearch:(NSString *)pdfId
+                        resolver:(RCTPromiseResolveBlock)resolve
+                        rejecter:(RCTPromiseRejectBlock)reject;
+
  - (void)searchTextBatchDirect:(NSString *)pdfId
                           terms:(NSArray *)terms
                        resolver:(RCTPromiseResolveBlock)resolve

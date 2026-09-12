@@ -18,6 +18,7 @@
 @implementation PDFJSIManager {
     BOOL _isJSIInitialized;
     dispatch_queue_t _backgroundQueue;
+    dispatch_queue_t _searchQueue;
 }
 
 RCT_EXPORT_MODULE(PDFJSIManager);
@@ -31,6 +32,11 @@ RCT_EXPORT_MODULE(PDFJSIManager);
     if (self) {
         _isJSIInitialized = NO;
         _backgroundQueue = dispatch_queue_create("com.pdfjsi.background", DISPATCH_QUEUE_CONCURRENT);
+        // Serial: searchTextDirect/searchTextBatchDirect share a cached, mutable PDFDocument per
+        // pdfId (SearchRegistry) — PDFKit does not guarantee that object safe for concurrent
+        // reads from multiple threads, so all search calls (any pdfId) run one at a time here
+        // instead of on the concurrent _backgroundQueue used by unrelated render/cache methods.
+        _searchQueue = dispatch_queue_create("com.pdfjsi.search", DISPATCH_QUEUE_SERIAL);
         
         RCTLogInfo(@"🚀 PDFJSIManager: Initializing high-performance PDF JSI manager for iOS");
         [self initializeJSI];
@@ -265,6 +271,23 @@ RCT_EXPORT_METHOD(registerPathForSearch:(NSString *)pdfId
     }
 }
 
+/**
+ * Drops the cached opened document (if any) and path for `pdfId`. Callers that register a
+ * pdfId headlessly without ever mounting a `Pdf` view for it (e.g. import-time highlight-rect
+ * precompute) must call this when done, or the opened PDFDocument + its path stay cached for
+ * the lifetime of the process. A later `Pdf` view mount for the same pdfId re-registers (and
+ * re-opens) independently, so this is always safe to call once a headless caller is finished.
+ */
+RCT_EXPORT_METHOD(unregisterPathForSearch:(NSString *)pdfId
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+{
+    if (pdfId.length) {
+        [SearchRegistry unregisterPath:pdfId];
+    }
+    resolve(@YES);
+}
+
 RCT_EXPORT_METHOD(searchTextDirect:(NSString *)pdfId
                   searchTerm:(NSString *)searchTerm
                   startPage:(NSInteger)startPage
@@ -280,8 +303,8 @@ RCT_EXPORT_METHOD(searchTextDirect:(NSString *)pdfId
         resolve(@[]);
         return;
     }
-    
-    dispatch_async(_backgroundQueue, ^{
+
+    dispatch_async(_searchQueue, ^{
         @try {
             RCTLogInfo(@"🔍 Searching text via JSI: '%@' in pages %ld-%ld", searchTerm, (long)startPage, (long)endPage);
             
@@ -384,7 +407,7 @@ RCT_EXPORT_METHOD(searchTextBatchDirect:(NSString *)pdfId
         return;
     }
 
-    dispatch_async(_backgroundQueue, ^{
+    dispatch_async(_searchQueue, ^{
         @try {
             NSString *path = [SearchRegistry pathForPdfId:pdfId];
             if (!path.length || [path hasPrefix:@"http://"] || [path hasPrefix:@"https://"]) {
