@@ -443,19 +443,6 @@ export default class Pdf extends Component {
             throw new Error('Specified pageNumber is not a number');
         }
         
-        // Use JSI only with a stable id (props.pdfId or per-mount instance id — not a new random id per call)
-        const pdfIdForJsi = this.props.pdfId || this._instancePdfId;
-        if (this.state.jsiAvailable && this.state.path && pdfIdForJsi) {
-            try {
-                this.pdfJSI.setCurrentPage(pdfIdForJsi, pageNumber);
-                if (__DEV__) {
-                    console.log(`🚀 JSI: Set page ${pageNumber} for PDF ${pdfIdForJsi}`);
-                }
-            } catch (error) {
-                console.warn('JSI setPage failed, falling back to standard method:', error);
-            }
-        }
-        
         if (!!global?.nativeFabricUIManager ) {
             if (this._root) {
                 // Lazy load PdfViewCommands if not already loaded

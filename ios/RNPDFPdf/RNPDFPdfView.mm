@@ -161,6 +161,41 @@ const float MIN_SCALE = 1.0f;
     }
 }
 
+// Same problem as the drag/decelerate callbacks above: PDFKit's own primary
+// delegate implements these to keep its internal page layout in sync during a
+// live pinch, so forwardingTargetForSelector: would route every zoom frame to
+// it exclusively and starve our secondary (self) — which is what redraws the
+// highlight overlay per-frame in -scrollViewDidZoom:. Without this, the
+// overlay only catches up via the coalesced scrollViewDidScroll: calls and
+// the final settle, which reads as the highlight lagging behind a pinch and
+// then snapping into place once the gesture ends.
+- (void)scrollViewDidZoom:(UIScrollView *)scrollView {
+    if (_primary && [_primary respondsToSelector:@selector(scrollViewDidZoom:)]) {
+        [_primary scrollViewDidZoom:scrollView];
+    }
+    if (_secondary && [_secondary respondsToSelector:@selector(scrollViewDidZoom:)]) {
+        [_secondary scrollViewDidZoom:scrollView];
+    }
+}
+
+- (void)scrollViewWillBeginZooming:(UIScrollView *)scrollView withView:(UIView *)view {
+    if (_primary && [_primary respondsToSelector:@selector(scrollViewWillBeginZooming:withView:)]) {
+        [_primary scrollViewWillBeginZooming:scrollView withView:view];
+    }
+    if (_secondary && [_secondary respondsToSelector:@selector(scrollViewWillBeginZooming:withView:)]) {
+        [_secondary scrollViewWillBeginZooming:scrollView withView:view];
+    }
+}
+
+- (void)scrollViewDidEndZooming:(UIScrollView *)scrollView withView:(UIView *)view atScale:(CGFloat)scale {
+    if (_primary && [_primary respondsToSelector:@selector(scrollViewDidEndZooming:withView:atScale:)]) {
+        [_primary scrollViewDidEndZooming:scrollView withView:view atScale:scale];
+    }
+    if (_secondary && [_secondary respondsToSelector:@selector(scrollViewDidEndZooming:withView:atScale:)]) {
+        [_secondary scrollViewDidEndZooming:scrollView withView:view atScale:scale];
+    }
+}
+
 - (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
     // First check if primary delegate (PDFView's internal) handles it
     if (_primary && [_primary respondsToSelector:@selector(viewForZoomingInScrollView:)]) {
