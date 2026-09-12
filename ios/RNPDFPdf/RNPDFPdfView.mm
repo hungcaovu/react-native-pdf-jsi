@@ -129,6 +129,38 @@ const float MIN_SCALE = 1.0f;
     }
 }
 
+// NOTE: forwardingTargetForSelector: only relays to a single target, so any
+// drag/decelerate callback PDFKit's own primary delegate also implements
+// (very likely, since it drives UIPageViewController's transition) would
+// otherwise starve our secondary (self) of these calls. Explicitly fan them
+// out to both, same as scrollViewDidScroll: above.
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    if (_primary && [_primary respondsToSelector:@selector(scrollViewWillBeginDragging:)]) {
+        [_primary scrollViewWillBeginDragging:scrollView];
+    }
+    if (_secondary && [_secondary respondsToSelector:@selector(scrollViewWillBeginDragging:)]) {
+        [_secondary scrollViewWillBeginDragging:scrollView];
+    }
+}
+
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    if (_primary && [_primary respondsToSelector:@selector(scrollViewDidEndDragging:willDecelerate:)]) {
+        [_primary scrollViewDidEndDragging:scrollView willDecelerate:decelerate];
+    }
+    if (_secondary && [_secondary respondsToSelector:@selector(scrollViewDidEndDragging:willDecelerate:)]) {
+        [_secondary scrollViewDidEndDragging:scrollView willDecelerate:decelerate];
+    }
+}
+
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    if (_primary && [_primary respondsToSelector:@selector(scrollViewDidEndDecelerating:)]) {
+        [_primary scrollViewDidEndDecelerating:scrollView];
+    }
+    if (_secondary && [_secondary respondsToSelector:@selector(scrollViewDidEndDecelerating:)]) {
+        [_secondary scrollViewDidEndDecelerating:scrollView];
+    }
+}
+
 - (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
     // First check if primary delegate (PDFView's internal) handles it
     if (_primary && [_primary respondsToSelector:@selector(viewForZoomingInScrollView:)]) {
@@ -209,6 +241,12 @@ const float MIN_SCALE = 1.0f;
     int _previousPage;
     BOOL _isNavigating;
     BOOL _documentLoaded;
+    // Tracks whether the user currently has a finger-driven scroll/page-turn
+    // in flight on _internalScrollView. A programmatic goToDestination/goToRect
+    // call while this is true can race UIPageViewController's own transition
+    // and trigger an uncaught NSInternalInconsistencyException inside
+    // UIKitCore's _UIQueuingScrollView (queuingScrollView:didEndManualScroll:...).
+    BOOL _isUserScrolling;
     
     // Track usePageViewController state to prevent unnecessary reconfiguration
     BOOL _currentUsePageViewController;
@@ -560,6 +598,52 @@ using namespace facebook::react;
     _page = pageValue;
 }
 
+// Jumps _pdfView to targetPage while usePageViewController paging mode is on.
+// Waits out any in-flight user-driven scroll/decelerate first (see call site
+// comment) instead of calling goToDestination:/goToRect:onPage: concurrently
+// with UIKit's own transition. Logs the exact inputs at each decision point so
+// a future crash report can be correlated with what this call was about to do.
+- (void)navigateToPageForPagingMode:(PDFPage *)pdfPage targetPage:(int)targetPage retriesLeft:(int)retriesLeft {
+    if (_isUserScrolling) {
+        if (retriesLeft <= 0) {
+            RCTLogWarn(@"⚠️ [iOS Scroll] Giving up on programmatic navigate to page %d (pageCount=%lu) - "
+                       @"user is still scrolling after retry budget exhausted. Skipping to avoid racing "
+                       @"UIPageViewController's own transition.",
+                       targetPage, (unsigned long)_pdfDocument.pageCount);
+            _isNavigating = NO;
+            return;
+        }
+        RCTLogInfo(@"⏳ [iOS Scroll] Deferring programmatic navigate to page %d (pageCount=%lu, retriesLeft=%d) - "
+                   @"user is actively scrolling (isUserScrolling=YES)",
+                   targetPage, (unsigned long)_pdfDocument.pageCount, retriesLeft);
+        __weak __typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf navigateToPageForPagingMode:pdfPage targetPage:targetPage retriesLeft:retriesLeft - 1];
+        });
+        return;
+    }
+
+    RCTLogInfo(@"➡️ [iOS Scroll] Performing programmatic navigate to page %d (pageCount=%lu, currentPage=%d)",
+               targetPage, (unsigned long)_pdfDocument.pageCount, _page);
+
+    if (targetPage == 1) {
+        // Special case for first page
+        [_pdfView goToRect:CGRectMake(0, NSUIntegerMax, 1, 1) onPage:pdfPage];
+    } else {
+        CGRect pdfPageRect = [pdfPage boundsForBox:kPDFDisplayBoxCropBox];
+        if (pdfPage.rotation == 90 || pdfPage.rotation == 270) {
+            pdfPageRect = CGRectMake(0, 0, pdfPageRect.size.height, pdfPageRect.size.width);
+        }
+        CGPoint pointLeftTop = CGPointMake(0, pdfPageRect.size.height);
+        PDFDestination *pdfDest = [[PDFDestination alloc] initWithPage:pdfPage atPoint:pointLeftTop];
+        [_pdfView goToDestination:pdfDest];
+        _pdfView.scaleFactor = _fixScaleFactor * _scale;
+    }
+
+    _previousPage = targetPage;
+    _isNavigating = NO;
+}
+
 - (void)PDFViewWillClickOnLink:(PDFView *)sender withURL:(NSURL *)url
 {
     NSString *_url = url.absoluteString;
@@ -909,42 +993,35 @@ using namespace facebook::react;
             PDFPage *pdfPage = [_pdfDocument pageAtIndex:_page-1];
             
             if (pdfPage) {
+                int targetPage = _page;
                 // Use smooth navigation instead of instant jump to prevent full rerender
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (!self->_enablePaging) {
                         // For non-paging mode, use animated navigation
                         CGRect pdfPageRect = [pdfPage boundsForBox:kPDFDisplayBoxCropBox];
-                        
+
                         // Handle page rotation
                         if (pdfPage.rotation == 90 || pdfPage.rotation == 270) {
                             pdfPageRect = CGRectMake(0, 0, pdfPageRect.size.height, pdfPageRect.size.width);
                         }
-                        
+
                         CGPoint pointLeftTop = CGPointMake(0, pdfPageRect.size.height);
                         PDFDestination *pdfDest = [[PDFDestination alloc] initWithPage:pdfPage atPoint:pointLeftTop];
-                        
+
                         // Use goToDestination for smooth navigation
                         [self->_pdfView goToDestination:pdfDest];
                         self->_pdfView.scaleFactor = self->_fixScaleFactor * self->_scale;
+                        self->_previousPage = self->_page;
+                        self->_isNavigating = NO;
                     } else {
-                        // For paging mode, use goToRect for better page alignment
-                        if (self->_page == 1) {
-                            // Special case for first page
-                            [self->_pdfView goToRect:CGRectMake(0, NSUIntegerMax, 1, 1) onPage:pdfPage];
-                        } else {
-                            CGRect pdfPageRect = [pdfPage boundsForBox:kPDFDisplayBoxCropBox];
-                            if (pdfPage.rotation == 90 || pdfPage.rotation == 270) {
-                                pdfPageRect = CGRectMake(0, 0, pdfPageRect.size.height, pdfPageRect.size.width);
-                            }
-                            CGPoint pointLeftTop = CGPointMake(0, pdfPageRect.size.height);
-                            PDFDestination *pdfDest = [[PDFDestination alloc] initWithPage:pdfPage atPoint:pointLeftTop];
-                            [self->_pdfView goToDestination:pdfDest];
-                            self->_pdfView.scaleFactor = self->_fixScaleFactor * self->_scale;
-                        }
+                        // Paging mode drives UIPageViewController under the hood. Calling
+                        // goToDestination:/goToRect:onPage: here while the user still has a
+                        // finger-driven page-turn in flight races UIKit's own transition and
+                        // can abort() inside _UIQueuingScrollView (see crash investigation on
+                        // 2026-09-12: identical signature in all 3 device crash reports,
+                        // queuingScrollView:didEndManualScroll:...). Defer instead of forcing it.
+                        [self navigateToPageForPagingMode:pdfPage targetPage:targetPage retriesLeft:10];
                     }
-                    
-                    self->_previousPage = self->_page;
-                    self->_isNavigating = NO;
                 });
             } else {
                 _isNavigating = NO;
@@ -1630,10 +1707,28 @@ using namespace facebook::react;
         }
     } else {
         if (scrollEventCount % 50 == 0) {
-            RCTLogWarn(@"⚠️ [iOS Scroll] No visible page found for scroll position (%.2f, %.2f)", 
+            RCTLogWarn(@"⚠️ [iOS Scroll] No visible page found for scroll position (%.2f, %.2f)",
                       pdfPoint.x, pdfPoint.y);
         }
     }
+}
+
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    _isUserScrolling = YES;
+    RCTLogInfo(@"👆 [iOS Scroll] scrollViewWillBeginDragging - enablePaging=%d, page=%d, pageCount=%lu",
+              _enablePaging, _page, (unsigned long)_pdfDocument.pageCount);
+}
+
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    if (!decelerate) {
+        _isUserScrolling = NO;
+        RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDragging (no decelerate) - isUserScrolling=NO");
+    }
+}
+
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    _isUserScrolling = NO;
+    RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDecelerating - isUserScrolling=NO");
 }
 
 #pragma mark - UIScrollViewDelegate Zoom Support
