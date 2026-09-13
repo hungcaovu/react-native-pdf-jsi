@@ -718,6 +718,17 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
             this.pageFling = false;
             this.pageSnap = false;
         }
+
+        // pageFling/pageSnap are otherwise only applied via the Configurator on the next
+        // full document load (see drawPdf()), which needsReload gates to path changes only.
+        // Toggling "single page view" while a document is already on screen left the old
+        // pageFling/pageSnap baked in from the initial load, so continuous mode kept
+        // snapping through pages on drag instead of tracking the finger 1:1. PDFView (the
+        // superclass) exposes live setters for both, so apply them immediately here too.
+        if (!needsReload && this.path != null && !this.isRecycled()) {
+            this.setPageFling(this.pageFling);
+            this.setPageSnap(this.pageSnap);
+        }
     }
 
     public void setFitPolicy(int fitPolicy) {

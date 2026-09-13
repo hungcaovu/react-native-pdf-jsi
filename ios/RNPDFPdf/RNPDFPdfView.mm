@@ -1795,55 +1795,27 @@ using namespace facebook::react;
 
     if (!_pdfDocument || _singlePage) {
         if (scrollEventCount % 10 == 0) {
-            RCTLogInfo(@"⏭️ [iOS Scroll] Skipping scroll handling - pdfDocument=%d, singlePage=%d", 
+            RCTLogInfo(@"⏭️ [iOS Scroll] Skipping scroll handling - pdfDocument=%d, singlePage=%d",
                       _pdfDocument != nil, _singlePage);
         }
         return;
     }
-    
-    // Calculate visible page based on scroll position
-    // Use the center point of the visible viewport
-    CGPoint centerPoint = CGPointMake(
-        scrollView.contentOffset.x + scrollView.bounds.size.width / 2,
-        scrollView.contentOffset.y + scrollView.bounds.size.height / 2
-    );
-    
-    // Convert to PDFView coordinates
-    CGPoint pdfPoint = [scrollView convertPoint:centerPoint toView:_pdfView];
-    PDFPage *visiblePage = [_pdfView pageForPoint:pdfPoint nearest:YES];
-    
-    if (visiblePage) {
-        unsigned long pageIndex = [_pdfDocument indexForPage:visiblePage];
-        int newPage = (int)pageIndex + 1;
-        
-        // Only update if page actually changed and is valid
-        if (newPage != _page && newPage > 0 && newPage <= (int)_pdfDocument.pageCount) {
-            RCTLogInfo(@"📄 [iOS Scroll] Page changed: %d -> %d (from scroll position)", _page, newPage);
-            
-            // CRITICAL FIX: Update _previousPage to the new page value when page changes from user scrolling
-            // This prevents updateProps from triggering programmatic navigation when React Native
-            // receives the pageChanged notification and updates the page prop back to us.
-            // By setting _previousPage = newPage, when updateProps checks _page != _previousPage,
-            // they will be equal (since React Native will set _page = newPage), and navigation will be skipped.
-            int oldPage = _page;
-            _page = newPage;
-            _previousPage = newPage;  // Set to newPage to prevent navigation loop
-            _pageCount = (int)_pdfDocument.pageCount;
-            
-            // Trigger preloading if enabled
-            if (_enablePreloading) {
-                [self preloadAdjacentPages:_page];
-            }
-            
-            // Notify about page change
-            [self notifyOnChangeWithMessage:[[NSString alloc] initWithString:[NSString stringWithFormat:@"pageChanged|%d|%lu", newPage, _pdfDocument.pageCount]]];
-        }
-    } else {
-        if (scrollEventCount % 50 == 0) {
-            RCTLogWarn(@"⚠️ [iOS Scroll] No visible page found for scroll position (%.2f, %.2f)",
-                      pdfPoint.x, pdfPoint.y);
-        }
-    }
+
+    // Page-change detection used to be duplicated here: this delegate guessed the
+    // "current" page from whichever page sat at the exact center of the viewport
+    // (contentOffset + bounds/2 -> convertPoint: -> pageForPoint:nearest:), racing
+    // PDFKit's own PDFViewPageChangedNotification (see onPageChanged: below), which
+    // already reports the same thing authoritatively. Right as a scroll settled
+    // (scrollViewDidEndDecelerating), this heuristic would occasionally compute a
+    // wildly wrong page for a single frame (e.g. 5->9, 13->32) before self-correcting
+    // a millisecond later — device logs from a 2026-09-13 investigation caught both
+    // the bogus reading and its correction back to back. Each bogus reading still got
+    // sent to JS as a real onPageChanged event; by the time React reflected that page
+    // back down as a prop, this view's own state had already self-corrected, so the
+    // updateProps loop-guard (_page != _previousPage) no longer matched and a real
+    // goToDestination: fired to the wrong page and then back — the actual cause of
+    // "drag jumps through many pages" reported for continuous-scroll mode. Removed;
+    // PDFViewPageChangedNotification is the sole page-change source now.
 }
 
 - (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
