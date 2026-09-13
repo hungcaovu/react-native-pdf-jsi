@@ -991,22 +991,28 @@ using namespace facebook::react;
             }
         }
 
-        // CRITICAL FIX: Only configure usePageViewController when path changes (document loading)
-        // This prevents unnecessary reconfigurations during scrolling and layout updates
-        // Once configured, usePageViewController doesn't need to be reconfigured unless the document changes
-        if (_pdfDocument && [effectiveChangedProps containsObject:@"path"]) {
+        // Reconfigure usePageViewController when the document (re)loads, or when the
+        // enablePaging/horizontal props actually flip at runtime (e.g. the reader's
+        // "single page view" toggle). Previously this only re-ran on `path` changes,
+        // so toggling enablePaging off after loading in paging mode left the
+        // UIPageViewController still driving page-turns underneath what the JS side
+        // believed was plain continuous scrolling — dragging would fling through many
+        // pages at once instead of tracking the drag distance.
+        BOOL shouldUsePageViewController = _enablePaging && !_horizontal;
+        if (_pdfDocument &&
+            ([effectiveChangedProps containsObject:@"path"] ||
+             ((!_usePageViewControllerStateInitialized || shouldUsePageViewController != _currentUsePageViewController) &&
+              ([changedProps containsObject:@"enablePaging"] || [changedProps containsObject:@"horizontal"])))) {
             // Fix: Disable usePageViewController when horizontal is true, as it conflicts with horizontal scrolling
             // UIPageViewController doesn't work well with horizontal PDFView display direction
-            BOOL shouldUsePageViewController = _enablePaging && !_horizontal;
-            
-            RCTLogInfo(@"🔄 [iOS Scroll] Configuring usePageViewController on document load - enablePaging=%d, horizontal=%d, usePageVC=%d", 
+            RCTLogInfo(@"🔄 [iOS Scroll] Configuring usePageViewController - enablePaging=%d, horizontal=%d, usePageVC=%d",
                       _enablePaging, _horizontal, shouldUsePageViewController);
-            
+
             // Set state immediately
             _currentUsePageViewController = shouldUsePageViewController;
             _usePageViewControllerStateInitialized = YES;
-            
-            // Configure usePageViewController - this only happens on document load
+
+            // Configure usePageViewController
             if (shouldUsePageViewController) {
                 // Only use page view controller for vertical orientation
                 [_pdfView usePageViewController:YES withViewOptions:@{UIPageViewControllerOptionSpineLocationKey:@(UIPageViewControllerSpineLocationMin),UIPageViewControllerOptionInterPageSpacingKey:@(_spacing)}];

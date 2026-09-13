@@ -108,6 +108,12 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
     // Track if document needs reload (FIX: Prevent recreation on prop changes)
     private boolean needsReload = true;
     private String lastLoadedPath = null;
+    // Last page actually jumped/scrolled to. onAfterUpdateTransaction calls drawPdf() after
+    // *every* prop commit (highlightRects included, which changes on every sentence advance),
+    // not just page/path changes — without this guard drawPdf()'s "skip reload" branch below
+    // would re-jumpTo the current page on every such commit, forcing a scroll-to-page-top even
+    // when the page never changed (visible as the reader "going back" to earlier sentences).
+    private int lastAppliedPage = -1;
     private float lastPageHeight = 0;
     private boolean loadCompleteDispatched = false;
     private int lastKnownPageCount = 0;
@@ -168,6 +174,7 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         }
         page = pageOneBased;
         this.page = page;
+        lastAppliedPage = page;
         showLog(format("%s %s / %s", path, page, numberOfPages));
         
         // Store page count when we get it (useful for loadComplete dispatch)
@@ -413,17 +420,24 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
             int pageOneBased = displayedPage + 1;
             try {
                 float pdfW = 0, pdfH = 0;
+                // Must be the *actual* PDF point size (same space PDFTextModule.getPageSize
+                // hands to JS for OCR highlight-rect math) — NOT PDFView/PdfFile's own
+                // getPageSize(int), which returns a view-fit-scaled size in an unrelated unit
+                // space and silently misplaces every highlight rect if used here.
+                //
+                // Read-only, non-blocking lookup: onLayerDrawn runs on the UI thread during the
+                // view's own draw pass, so measuring the page (file I/O + native Pdfium calls)
+                // synchronously here is not an option — it's slow enough to jank on its own, and
+                // risks deadlocking against the renderer's own concurrent native Pdfium calls.
+                // On a cache miss we kick off the measurement in the background and just skip
+                // drawing the highlight for this frame; ensurePageSizePointsAsync's onReady
+                // (postInvalidate) redraws once the real size is known and cached.
                 float[] sizePt = SearchRegistry.getPageSizePoints(pdfId, displayedPage);
                 if (sizePt != null && sizePt.length >= 2 && sizePt[0] > 0 && sizePt[1] > 0) {
                     pdfW = sizePt[0];
                     pdfH = sizePt[1];
-                }
-                if (pdfW <= 0 || pdfH <= 0) {
-                    SizeF fallback = getPageSize(displayedPage);
-                    if (fallback != null) {
-                        pdfW = fallback.getWidth();
-                        pdfH = fallback.getHeight();
-                    }
+                } else {
+                    SearchRegistry.ensurePageSizePointsAsync(pdfId, this.path, getContext().getApplicationContext(), displayedPage, this::postInvalidate);
                 }
                 if (pdfW > 0 && pdfH > 0) {
                     float scaleX = pageWidth / pdfW;
@@ -507,10 +521,14 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         // Only reload if path changed or this is first load
         if (!needsReload && this.path != null && this.path.equals(lastLoadedPath)) {
             showLog(format("drawPdf: Skipping reload, path unchanged: %s", this.path));
-            // Just jump to the page if needed, dont reload entire document
-            if (this.page > 0 && !this.isRecycled()) {
+            // Just jump to the page if needed, dont reload entire document.
+            // Guarded on lastAppliedPage — this runs on every prop-update transaction
+            // (e.g. every highlightRects change during playback), not just real page
+            // changes, so without the guard it would re-jump or the same page every time.
+            if (this.page > 0 && !this.isRecycled() && this.page != lastAppliedPage) {
                 armProgrammaticJump(this.page);
                 this.jumpTo(this.page - 1, false);
+                lastAppliedPage = this.page;
             }
             // If PDF is already loaded but loadComplete event hasn't been dispatched yet, dispatch it now
             if (!loadCompleteDispatched && !this.isRecycled() && lastKnownPageCount > 0) {
@@ -590,6 +608,7 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         }
         needsReload = true;
         programmaticTargetPage = -1;
+        lastAppliedPage = -1;
         mainHandler.removeCallbacks(clearProgrammaticTargetRunnable);
         this.path = path;
         loadCompleteDispatched = false;
@@ -648,6 +667,7 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
             armProgrammaticJump(newPage);
             showLog(format("setPage: Jumping to page %d (from %d)", newPage, oldPage));
             this.jumpTo(newPage - 1, false);
+            lastAppliedPage = newPage;
         }
     }
 
