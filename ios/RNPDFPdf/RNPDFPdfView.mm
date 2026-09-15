@@ -281,6 +281,15 @@ const float MIN_SCALE = 1.0f;
 >
 @end
 
+// Gesture/transition state for the paging (UIPageViewController) mode's
+// finger-driven scroll vs. UIKit's own internal transition cleanup — see the
+// _pageTransitionState ivar comment below for why a plain bool wasn't enough.
+typedef NS_ENUM(NSInteger, RNPDFPageTransitionState) {
+    RNPDFPageTransitionIdle = 0,
+    RNPDFPageTransitionUserDriven,
+    RNPDFPageTransitionSettling,
+};
+
 @implementation RNPDFPdfView
 {
     RCTBridge *_bridge;
@@ -322,12 +331,29 @@ const float MIN_SCALE = 1.0f;
     int _previousPage;
     BOOL _isNavigating;
     BOOL _documentLoaded;
-    // Tracks whether the user currently has a finger-driven scroll/page-turn
-    // in flight on _internalScrollView. A programmatic goToDestination/goToRect
-    // call while this is true can race UIPageViewController's own transition
-    // and trigger an uncaught NSInternalInconsistencyException inside
-    // UIKitCore's _UIQueuingScrollView (queuingScrollView:didEndManualScroll:...).
-    BOOL _isUserScrolling;
+    // Three-state gesture/transition tracker, replacing a plain "_isUserScrolling"
+    // bool. The old bool flipped to NO the instant scrollViewDidEndDragging:/
+    // scrollViewDidEndDecelerating: fired — but those UIScrollViewDelegate calls
+    // are themselves invoked *from inside* UIKit's own transition-cleanup call
+    // stack (_UIQueuingScrollView's didEndManualScroll:...), which hasn't
+    // returned yet. A programmatic goToDestination:/goToRect:onPage: issued the
+    // instant the bool went NO could still land inside that still-unwinding
+    // stack frame and re-enter -[UIPageViewController setViewControllers:...],
+    // which UIKit does not support and asserts on -> abort() (see the 2026-09-15
+    // device crash: RNPDFPdfView navigateToPageForPagingMode: -> goToDestination:
+    // -> ... -> _UIQueuingScrollView cleanupWithFinishedState: -> NSAssertionHandler).
+    // RNPDFPageTransitionSettling exists specifically to force one extra run-loop
+    // turn (via dispatch_async, not a fixed delay) after the drag/decelerate ends,
+    // so UIKit's own internal frame has actually returned by the time we call
+    // anything Idle again. Also gates handleSingleTap: below: a tap that lands
+    // while we're still Settling is the tail of the same swipe gesture landing a
+    // beat late, not a deliberate "tap to play" — only a tap seen while Idle
+    // should be treated as intentional.
+    RNPDFPageTransitionState _pageTransitionState;
+    // Bumped every time a new drag begins; a deferred Settling->Idle flip
+    // captures this and only applies if it still matches, so a fresh gesture
+    // that starts during the deferred window correctly cancels the old flip.
+    NSInteger _pageTransitionGeneration;
     
     // Track usePageViewController state to prevent unnecessary reconfiguration
     BOOL _currentUsePageViewController;
@@ -689,12 +715,13 @@ using namespace facebook::react;
 }
 
 // Jumps _pdfView to targetPage while usePageViewController paging mode is on.
-// Waits out any in-flight user-driven scroll/decelerate first (see call site
-// comment) instead of calling goToDestination:/goToRect:onPage: concurrently
-// with UIKit's own transition. Logs the exact inputs at each decision point so
-// a future crash report can be correlated with what this call was about to do.
+// Waits out any in-flight user-driven scroll/decelerate (and its Settling
+// tail — see _pageTransitionState comment) instead of calling
+// goToDestination:/goToRect:onPage: concurrently with UIKit's own transition.
+// Logs the exact inputs at each decision point so a future crash report can
+// be correlated with what this call was about to do.
 - (void)navigateToPageForPagingMode:(PDFPage *)pdfPage targetPage:(int)targetPage retriesLeft:(int)retriesLeft {
-    if (_isUserScrolling) {
+    if (_pageTransitionState != RNPDFPageTransitionIdle) {
         if (retriesLeft <= 0) {
             RCTLogWarn(@"⚠️ [iOS Scroll] Giving up on programmatic navigate to page %d (pageCount=%lu) - "
                        @"user is still scrolling after retry budget exhausted. Skipping to avoid racing "
@@ -704,8 +731,8 @@ using namespace facebook::react;
             return;
         }
         RCTLogInfo(@"⏳ [iOS Scroll] Deferring programmatic navigate to page %d (pageCount=%lu, retriesLeft=%d) - "
-                   @"user is actively scrolling (isUserScrolling=YES)",
-                   targetPage, (unsigned long)_pdfDocument.pageCount, retriesLeft);
+                   @"page transition state=%ld (not Idle)",
+                   targetPage, (unsigned long)_pdfDocument.pageCount, retriesLeft, (long)_pageTransitionState);
         __weak __typeof(self) weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [weakSelf navigateToPageForPagingMode:pdfPage targetPage:targetPage retriesLeft:retriesLeft - 1];
@@ -1579,6 +1606,20 @@ using namespace facebook::react;
 {
     //_pdfView.scaleFactor = _pdfView.minScaleFactor;
 
+    // A discrete tap can still land while the page view is Settling from a
+    // just-finished swipe (UIKit's own transition hasn't fully unwound yet -
+    // see _pageTransitionState). That tap is the tail end of the swipe
+    // gesture arriving a beat late, not the user deliberately tapping a
+    // sentence to play it - honoring it as "tap to play" is exactly the
+    // second, colliding page-navigation trigger that caused the 2026-09-15
+    // crash (JS's follow-playback effect calling setPage in response). Only
+    // forward taps seen once the page has fully settled (Idle).
+    if (_pageTransitionState != RNPDFPageTransitionIdle) {
+        RCTLogInfo(@"👆 [iOS Scroll] Ignoring single tap - page transition state=%ld (not Idle)",
+                   (long)_pageTransitionState);
+        return;
+    }
+
     CGPoint point = [sender locationInView:self];
     PDFPage *pdfPage = [_pdfView pageForPoint:point nearest:NO];
     if (pdfPage) {
@@ -1833,22 +1874,46 @@ using namespace facebook::react;
     // PDFViewPageChangedNotification is the sole page-change source now.
 }
 
+// Marks the gesture Settling (not yet Idle) and, after one extra run-loop
+// turn, flips it to Idle — but only if no newer gesture started meanwhile.
+// The dispatch_async (not a fixed delay) is the actual fix: it guarantees
+// UIKit's own synchronous transition-cleanup call stack (the one that invoked
+// the scrollViewDidEndDragging:/scrollViewDidEndDecelerating: we're called
+// from) has fully returned before anything treats the view as Idle again.
+- (void)beginSettlingAfterUserGestureEnd {
+    _pageTransitionState = RNPDFPageTransitionSettling;
+    NSInteger generation = ++_pageTransitionGeneration;
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (strongSelf->_pageTransitionGeneration != generation) {
+            // A new drag started while we were waiting out this run-loop turn -
+            // that gesture owns the state now, leave it alone.
+            return;
+        }
+        strongSelf->_pageTransitionState = RNPDFPageTransitionIdle;
+        RCTLogInfo(@"👆 [iOS Scroll] page transition settled -> Idle");
+    });
+}
+
 - (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
-    _isUserScrolling = YES;
+    _pageTransitionState = RNPDFPageTransitionUserDriven;
+    ++_pageTransitionGeneration;
     RCTLogInfo(@"👆 [iOS Scroll] scrollViewWillBeginDragging - enablePaging=%d, page=%d, pageCount=%lu",
               _enablePaging, _page, (unsigned long)_pdfDocument.pageCount);
 }
 
 - (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
     if (!decelerate) {
-        _isUserScrolling = NO;
-        RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDragging (no decelerate) - isUserScrolling=NO");
+        RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDragging (no decelerate) - Settling");
+        [self beginSettlingAfterUserGestureEnd];
     }
 }
 
 - (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
-    _isUserScrolling = NO;
-    RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDecelerating - isUserScrolling=NO");
+    RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDecelerating - Settling");
+    [self beginSettlingAfterUserGestureEnd];
 }
 
 #pragma mark - UIScrollViewDelegate Zoom Support

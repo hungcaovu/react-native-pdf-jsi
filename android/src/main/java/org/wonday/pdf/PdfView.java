@@ -80,6 +80,59 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         mainHandler.removeCallbacks(clearProgrammaticTargetRunnable);
         mainHandler.postDelayed(clearProgrammaticTargetRunnable, 500);
     }
+
+    // Mirrors the iOS fork's _pageTransitionState (see RNPDFPdfView.mm): unlike iOS,
+    // this library's jumpTo()/AnimationManager is a plain restartable ValueAnimator
+    // with no OS-owned invariant to violate, so calling jumpTo() mid-gesture here
+    // can't abort() the app the way it did on iOS (2026-09-15 crash investigation).
+    // We still track the same three states, because the same *logical* bug exists
+    // without the hard crash: a tap landing right after the user releases a swipe
+    // (while our own page-fling animation is still settling) would otherwise be
+    // forwarded as "pageSingleTap" and, with tapSentenceToPlay on, misread as a
+    // deliberate tap-to-play - not the trailing edge of the swipe - and jumpTo()
+    // would then cut off the still-playing fling under the user's thumb.
+    private static final int PAGE_TRANSITION_IDLE = 0;
+    private static final int PAGE_TRANSITION_USER_DRIVEN = 1;
+    private static final int PAGE_TRANSITION_SETTLING = 2;
+    private int pageTransitionState = PAGE_TRANSITION_IDLE;
+    private int pageTransitionGeneration = 0;
+    // Fallback for a fling that bounces back to the same page (no onPageChanged
+    // fires to clear it authoritatively) - roughly this library's default page-fling
+    // animation duration, so this rarely has to be the thing that resolves it.
+    private static final long PAGE_TRANSITION_SETTLE_TIMEOUT_MS = 400;
+
+    private void beginSettlingAfterUserGestureEnd() {
+        pageTransitionState = PAGE_TRANSITION_SETTLING;
+        final int generation = ++pageTransitionGeneration;
+        mainHandler.postDelayed(() -> {
+            if (pageTransitionGeneration != generation) {
+                // A new touch started while we were waiting this out - that
+                // gesture owns the state now, leave it alone.
+                return;
+            }
+            pageTransitionState = PAGE_TRANSITION_IDLE;
+            showLog("page transition settled (timeout) -> Idle");
+        }, PAGE_TRANSITION_SETTLE_TIMEOUT_MS);
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                pageTransitionState = PAGE_TRANSITION_USER_DRIVEN;
+                ++pageTransitionGeneration;
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                if (pageTransitionState == PAGE_TRANSITION_USER_DRIVEN) {
+                    beginSettlingAfterUserGestureEnd();
+                }
+                break;
+            default:
+                break;
+        }
+        return super.dispatchTouchEvent(event);
+    }
     private boolean horizontal = false;
     private float scale = 1;
     private float minScale = 1;
@@ -171,6 +224,13 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         if (programmaticTargetPage >= 1 && pageOneBased == programmaticTargetPage) {
             mainHandler.removeCallbacks(clearProgrammaticTargetRunnable);
             programmaticTargetPage = -1;
+        }
+        // Authoritative "the library actually landed on a page" signal - same role
+        // PDFViewPageChangedNotification plays on iOS. Cuts the Settling window
+        // short instead of waiting out PAGE_TRANSITION_SETTLE_TIMEOUT_MS.
+        if (pageTransitionState == PAGE_TRANSITION_SETTLING) {
+            ++pageTransitionGeneration;
+            pageTransitionState = PAGE_TRANSITION_IDLE;
         }
         page = pageOneBased;
         this.page = page;
@@ -354,6 +414,17 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
 
     @Override
     public boolean onTap(MotionEvent e){
+
+        // A tap can still land while we're Settling from a just-released swipe/
+        // fling (see pageTransitionState above). That's the trailing edge of the
+        // swipe arriving a beat late, not the user deliberately tapping a
+        // sentence to play it - forward only taps seen once the page has fully
+        // settled (Idle). Still return true so the base view treats it as
+        // consumed rather than falling through to some other gesture path.
+        if (pageTransitionState != PAGE_TRANSITION_IDLE) {
+            showLog(format("onTap: ignoring - page transition state=%d (not Idle)", pageTransitionState));
+            return true;
+        }
 
         // maybe change by other instance, restore zoom setting
         //Constants.Pinch.MINIMUM_ZOOM = this.minScale;
