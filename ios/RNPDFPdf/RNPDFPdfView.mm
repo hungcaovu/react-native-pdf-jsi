@@ -65,13 +65,14 @@ const float MIN_SCALE = 1.0f;
 
 @implementation HighlightOverlayView
 
-/** Same "page rect string -> on-screen rect" conversion used by both highlightRects and skipZoneRects — goes through PDFKit's own convertRect:fromPage:, so it's correct at any zoom/pan, live-pinch transform included (see scrollViewDidZoom: below). */
+/** Same "page rect string -> overlay-local rect" conversion used by both highlightRects and skipZoneRects. */
 - (BOOL)viewRect:(CGRect *)outRect forPageRectString:(NSString *)rectStr onPage:(PDFPage *)page inView:(PDFView *)pv {
     NSArray<NSString *> *parts = [rectStr componentsSeparatedByString:@","];
     if (parts.count != 4) return NO;
     CGFloat left = parts[0].doubleValue, top = parts[1].doubleValue, right = parts[2].doubleValue, bottom = parts[3].doubleValue;
     CGRect pageRect = CGRectMake(left, bottom, right - left, top - bottom);
-    *outRect = [pv convertRect:pageRect fromPage:page];
+    CGRect pdfViewRect = [pv convertRect:pageRect fromPage:page];
+    *outRect = [self convertRect:pdfViewRect fromView:pv];
     return YES;
 }
 
@@ -337,17 +338,6 @@ const float MIN_SCALE = 1.0f;
     NSArray *_highlightRects;
     NSArray *_skipZoneRects;
     HighlightOverlayView *_highlightOverlay;
-    // Live-pinch tracking for the highlight overlay (see scrollViewWillBeginZooming:/
-    // scrollViewDidZoom: below): a per-frame drawRect: redraw during a live pinch can't
-    // keep up with the gesture (CoreGraphics fill loop over every rect, every frame),
-    // which reads as the highlight lagging behind or not zooming at all until the
-    // gesture settles. Instead we apply a cheap CGAffineTransform to the overlay layer
-    // itself while zooming (matching exactly how UIScrollView is already moving the PDF
-    // content underneath) and only fall back to a precise drawRect: refresh once the
-    // gesture ends.
-    CGFloat _highlightZoomBaselineScale;
-    CGPoint _highlightZoomBaselineOffset;
-    BOOL _highlightZoomActive;
     /// Local file path when document loaded (used for SearchRegistry; may differ from _path which can be URI)
     NSString *_lastLoadedPath;
 }
@@ -1291,22 +1281,48 @@ using namespace facebook::react;
     }
 }
 
+/** Returns the PDFKit content view that actually zooms, so highlights scale/pan with the page instead of floating above it. */
+- (UIView *)highlightContainerView {
+    if (_pdfView.documentView) {
+        return _pdfView.documentView;
+    }
+
+    UIScrollView *scrollView = _internalScrollView;
+    for (UIView *subview in scrollView.subviews) {
+        NSString *className = NSStringFromClass([subview class]);
+        if ([className containsString:@"PDFDocumentView"] || [className containsString:@"PDFPage"]) {
+            return subview;
+        }
+    }
+
+    return _pdfView;
+}
+
 /** Lazily creates the shared overlay (used by both highlightRects and skipZoneRects) on first use by either. */
 - (void)ensureHighlightOverlay {
     if (_highlightOverlay || !_pdfView) return;
-    _highlightOverlay = [[HighlightOverlayView alloc] initWithFrame:_pdfView.bounds];
+    UIView *container = [self highlightContainerView];
+    _highlightOverlay = [[HighlightOverlayView alloc] initWithFrame:container.bounds];
     _highlightOverlay.backgroundColor = [UIColor clearColor];
     _highlightOverlay.userInteractionEnabled = NO;
     _highlightOverlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _highlightOverlay.pdfView = _pdfView;
-    // Anchor at the top-left (not the default center) so the live-pinch
-    // CGAffineTransform applied in scrollViewDidZoom: below composes with plain
-    // top-left-origin screen-space math, matching convertRect:fromPage:'s space.
-    CGRect overlayFrame = _highlightOverlay.frame;
-    _highlightOverlay.layer.anchorPoint = CGPointZero;
-    _highlightOverlay.frame = overlayFrame;
-    [_pdfView addSubview:_highlightOverlay];
-    [_pdfView bringSubviewToFront:_highlightOverlay];
+    [container addSubview:_highlightOverlay];
+    [container bringSubviewToFront:_highlightOverlay];
+}
+
+- (void)refreshHighlightOverlayContainer {
+    if (!_highlightOverlay || !_pdfView) return;
+
+    UIView *container = [self highlightContainerView];
+    if (_highlightOverlay.superview != container) {
+        [_highlightOverlay removeFromSuperview];
+        [container addSubview:_highlightOverlay];
+    }
+    _highlightOverlay.transform = CGAffineTransformIdentity;
+    _highlightOverlay.frame = container.bounds;
+    [container bringSubviewToFront:_highlightOverlay];
+    [_highlightOverlay setNeedsDisplay];
 }
 
 - (void)setHighlightRects:(NSArray *)highlightRects {
@@ -1772,11 +1788,10 @@ using namespace facebook::react;
 #pragma mark - UIScrollViewDelegate
 
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
-    // Redraw highlight overlay so rects stay aligned when user scrolls (pan). Zooming
-    // also fires this (content offset changes as UIScrollView keeps the pinch focal
-    // point fixed) — skip the redraw then, scrollViewDidZoom:'s cheap transform already
-    // owns tracking for the duration of the gesture.
-    if (_highlightOverlay && !_highlightZoomActive) [_highlightOverlay setNeedsDisplay];
+    // Redraw highlight overlay so rects stay aligned when user scrolls (pan).
+    if (_highlightOverlay) {
+        [self refreshHighlightOverlayContainer];
+    }
     static int scrollEventCount = 0;
     scrollEventCount++;
 
@@ -1839,25 +1854,10 @@ using namespace facebook::react;
 #pragma mark - UIScrollViewDelegate Zoom Support
 
 - (void)scrollViewDidZoom:(UIScrollView *)scrollView {
-    // Called on every frame of a live pinch — track it with a cheap CGAffineTransform
-    // instead of setNeedsDisplay's full CoreGraphics redraw (drawRect: re-fills every
-    // highlight rect from scratch, which can't keep up at 60-120fps and reads as the
-    // highlight lagging behind the pinch or not moving at all until it settles).
-    // _highlightOverlay sits outside the scroll view's zoomed content (it's a sibling
-    // subview added directly to _pdfView, so drawRect: stays valid math via
-    // convertRect:fromPage:), so it needs its own transform that mirrors exactly how
-    // the scroll view is repositioning that content: for a content-space point p,
-    // screenPoint(t) = p*zoomScale(t) - contentOffset(t). Solving for p from the
-    // baseline captured in scrollViewWillBeginZooming: and substituting back in gives
-    // the affine transform below, applied relative to the overlay's already-drawn
-    // (baseline-scale) content.
-    if (_highlightOverlay && _highlightZoomActive && _highlightZoomBaselineScale > 0) {
-        CGFloat relativeScale = scrollView.zoomScale / _highlightZoomBaselineScale;
-        CGFloat tx = _highlightZoomBaselineOffset.x * relativeScale - scrollView.contentOffset.x;
-        CGFloat ty = _highlightZoomBaselineOffset.y * relativeScale - scrollView.contentOffset.y;
-        _highlightOverlay.transform = CGAffineTransformMake(relativeScale, 0, 0, relativeScale, tx, ty);
-    } else if (_highlightOverlay) {
-        [_highlightOverlay setNeedsDisplay];
+    // The overlay is parented under the same PDFKit content view that UIScrollView zooms,
+    // so zoom/pan tracking comes from UIKit instead of a separate hand-built transform.
+    if (_highlightOverlay) {
+        [self refreshHighlightOverlayContainer];
     }
     if (_fixScaleFactor > 0 && _pdfView.scaleFactor > 0) {
         float newScale = _pdfView.scaleFactor / _fixScaleFactor;
@@ -1895,23 +1895,17 @@ using namespace facebook::react;
 }
 
 - (void)scrollViewWillBeginZooming:(UIScrollView *)scrollView withView:(UIView *)view {
-    // Capture the baseline scrollViewDidZoom: transforms from — the overlay's current
-    // drawRect: content is valid exactly at this zoomScale/contentOffset.
-    _highlightZoomBaselineScale = scrollView.zoomScale;
-    _highlightZoomBaselineOffset = scrollView.contentOffset;
-    _highlightZoomActive = (_highlightZoomBaselineScale > 0);
+    if (_highlightOverlay) {
+        [self refreshHighlightOverlayContainer];
+    }
     RCTLogInfo(@"🔍 [iOS Zoom] Will begin zooming");
 }
 
 - (void)scrollViewDidEndZooming:(UIScrollView *)scrollView
                         withView:(UIView *)view
                          atScale:(CGFloat)scale {
-    // Drop the live-pinch transform and redraw precisely at the settled scale — avoids
-    // compounding transform rounding drift across repeated pinch gestures.
-    _highlightZoomActive = NO;
     if (_highlightOverlay) {
-        _highlightOverlay.transform = CGAffineTransformIdentity;
-        [_highlightOverlay setNeedsDisplay];
+        [self refreshHighlightOverlayContainer];
     }
     RCTLogInfo(@"🔍 [iOS Zoom] Did end zooming at scale %f", scale);
 }
