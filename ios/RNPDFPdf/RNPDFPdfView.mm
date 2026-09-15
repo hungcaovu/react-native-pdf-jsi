@@ -412,6 +412,7 @@ using namespace facebook::react;
 - (void)updateProps:(Props::Shared const &)props oldProps:(Props::Shared const &)oldProps
 {
     const auto &newProps = *std::static_pointer_cast<const RNPDFPdfViewProps>(props);
+    const auto *oldPdfProps = oldProps ? std::static_pointer_cast<const RNPDFPdfViewProps>(oldProps).get() : nullptr;
     NSMutableArray<NSString *> *updatedPropNames = [NSMutableArray new];
     if (_path != RCTNSStringFromStringNilIfEmpty(newProps.path)) {
         _path = RCTNSStringFromStringNilIfEmpty(newProps.path);
@@ -421,7 +422,15 @@ using namespace facebook::react;
         _page = newProps.page;
         [updatedPropNames addObject:@"page"];
     }
-    if (_scale != newProps.scale) {
+    // `_scale` doubles as "current effective pinch/double-tap zoom" (mutated by
+    // onScaleChanged/handleDoubleTap, outside of props) and "last scale prop applied".
+    // Diffing against `_scale` itself means any re-render after the user has zoomed
+    // in — even one unrelated to zoom, like a page/highlightRects update while
+    // playback is running — sees `_scale` (e.g. 2.0) != `newProps.scale` (always the
+    // JS default of 1, since callers never drive zoom via the prop) and snaps the
+    // live zoom back to fit. Diff against the previous *props* value instead, so this
+    // only fires on a genuine JS-driven scale change.
+    if (!oldPdfProps || oldPdfProps->scale != newProps.scale) {
         _scale = newProps.scale;
         [updatedPropNames addObject:@"scale"];
     }
