@@ -472,6 +472,13 @@ using namespace facebook::react;
         [updatedPropNames addObject:@"page"];
     }
     if (_scale != newProps.scale) {
+        // This fires on ANY prop update once JS's `scale` prop stops matching what the
+        // user's pinch/native side is currently tracking here (e.g. JS never overrides
+        // the fork's default `scale=1`) — even when this updateProps call was only about
+        // `page` or `highlightRects` changing. That mismatch is exactly what snaps the
+        // view's real zoom back to `_scale` below, so log it whenever it's about to happen.
+        RCTLogInfo(@"🔍 [iOS Zoom] scale prop diff: native _scale=%f -> incoming newProps.scale=%f (changedProps so far=%@)",
+                   _scale, newProps.scale, updatedPropNames);
         _scale = newProps.scale;
         [updatedPropNames addObject:@"scale"];
     }
@@ -785,9 +792,45 @@ using namespace facebook::react;
         if (pdfPage.rotation == 90 || pdfPage.rotation == 270) {
             pdfPageRect = CGRectMake(0, 0, pdfPageRect.size.height, pdfPageRect.size.width);
         }
-        CGPoint pointLeftTop = CGPointMake(0, pdfPageRect.size.height);
-        PDFDestination *pdfDest = [[PDFDestination alloc] initWithPage:pdfPage atPoint:pointLeftTop];
-        [_pdfView goToDestination:pdfDest];
+
+        // Preserve the user's zoomed-in viewport position across the page swap instead of
+        // always landing on the new page's top-left corner: capture where on the OLD page
+        // the visible viewport currently sits, as a FRACTION of that page's bounds, then
+        // apply the same fraction to the NEW page. A user reading zoomed into the middle of
+        // page 5 should see the middle of page 6 next — this is only a page-content swap
+        // (plus the highlight overlay refreshing), not a reason to move the viewport.
+        PDFPage *previousVisiblePage = _pdfView.currentPage;
+        BOOL preservedViewport = NO;
+        if (previousVisiblePage && previousVisiblePage != pdfPage) {
+            CGRect previousPageBounds = [previousVisiblePage boundsForBox:kPDFDisplayBoxCropBox];
+            if (previousVisiblePage.rotation == 90 || previousVisiblePage.rotation == 270) {
+                previousPageBounds = CGRectMake(0, 0, previousPageBounds.size.height, previousPageBounds.size.width);
+            }
+            if (previousPageBounds.size.width > 0 && previousPageBounds.size.height > 0) {
+                CGRect visibleRectOnPreviousPage = [_pdfView convertRect:_pdfView.bounds toPage:previousVisiblePage];
+                CGFloat fracX = (visibleRectOnPreviousPage.origin.x - previousPageBounds.origin.x) / previousPageBounds.size.width;
+                CGFloat fracY = (visibleRectOnPreviousPage.origin.y - previousPageBounds.origin.y) / previousPageBounds.size.height;
+                CGFloat fracW = visibleRectOnPreviousPage.size.width / previousPageBounds.size.width;
+                CGFloat fracH = visibleRectOnPreviousPage.size.height / previousPageBounds.size.height;
+                CGRect targetRect = CGRectMake(
+                    pdfPageRect.origin.x + fracX * pdfPageRect.size.width,
+                    pdfPageRect.origin.y + fracY * pdfPageRect.size.height,
+                    fracW * pdfPageRect.size.width,
+                    fracH * pdfPageRect.size.height
+                );
+                RCTLogInfo(@"📍 [iOS Scroll] Preserving relative viewport across page swap %d -> %d: frac=(%.3f,%.3f,%.3f,%.3f)",
+                           _page, targetPage, fracX, fracY, fracW, fracH);
+                [_pdfView goToRect:targetRect onPage:pdfPage];
+                preservedViewport = YES;
+            }
+        }
+        if (!preservedViewport) {
+            CGPoint pointLeftTop = CGPointMake(0, pdfPageRect.size.height);
+            PDFDestination *pdfDest = [[PDFDestination alloc] initWithPage:pdfPage atPoint:pointLeftTop];
+            [_pdfView goToDestination:pdfDest];
+        }
+        // goToRect:onPage: adjusts scaleFactor to fit the target rect — reapply the
+        // user's actual current scale afterward so the zoom level itself is untouched too.
         _pdfView.scaleFactor = _fixScaleFactor * _scale;
     }
 
@@ -1588,6 +1631,21 @@ using namespace facebook::react;
     // _onChange(@{ @"message": @"pageDoubleTap" });
 
     if (!_enableDoubleTapZoom) {
+        return;
+    }
+
+    // A double tap can land at the tail of an in-flight finger-driven page
+    // swipe in paging mode, just like the single tap this same guard
+    // protects below (see handleSingleTap: and the _pageTransitionState
+    // comment on the ivar declaration). goToRect:onPage: below races
+    // UIKit's own _UIQueuingScrollView transition cleanup the same way
+    // navigateToPageForPagingMode:'s goToDestination:/goToRect:onPage: did
+    // in the 2026-09-12/2026-09-15 device crashes (queuingScrollView:
+    // didEndManualScroll:... -> abort()); this was the one call site still
+    // missing that guard as of the 2026-09-17 recurrence.
+    if (_pageTransitionState != RNPDFPageTransitionIdle) {
+        RCTLogInfo(@"👆 [iOS Scroll] Ignoring double tap zoom - page transition state=%ld (not Idle)",
+                   (long)_pageTransitionState);
         return;
     }
 
