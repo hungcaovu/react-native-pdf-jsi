@@ -56,24 +56,68 @@ const float MAX_SCALE = 3.0f;
 const float MIN_SCALE = 1.0f;
 
 
+/** A highlight/skip-zone rect, pre-parsed once when the data arrives — not re-parsed from
+ *  its wire-format string on every -drawRect: call (see HighlightOverlayView below). */
+@interface RNPDFParsedRect : NSObject
+@property (nonatomic) NSInteger page;      // 1-based, matches the wire format
+@property (nonatomic) CGRect pageRect;     // PDF page-point space, already numeric
+@end
+@implementation RNPDFParsedRect
+@end
+
 /** Overlay that draws highlight rects (and skip-zone hatch bands) on top of the PDF view. */
 @interface HighlightOverlayView : UIView
 @property (nonatomic, weak) PDFView *pdfView;
 @property (nonatomic, copy) NSArray<NSDictionary *> *highlightRects;
 @property (nonatomic, copy) NSArray<NSDictionary *> *skipZoneRects;
+@property (nonatomic, copy) NSArray<RNPDFParsedRect *> *parsedHighlightRects;
+@property (nonatomic, copy) NSArray<RNPDFParsedRect *> *parsedSkipZoneRects;
 @end
 
 @implementation HighlightOverlayView
 
-/** Same "page rect string -> overlay-local rect" conversion used by both highlightRects and skipZoneRects. */
-- (BOOL)viewRect:(CGRect *)outRect forPageRectString:(NSString *)rectStr onPage:(PDFPage *)page inView:(PDFView *)pv {
-    NSArray<NSString *> *parts = [rectStr componentsSeparatedByString:@","];
-    if (parts.count != 4) return NO;
-    CGFloat left = parts[0].doubleValue, top = parts[1].doubleValue, right = parts[2].doubleValue, bottom = parts[3].doubleValue;
-    CGRect pageRect = CGRectMake(left, bottom, right - left, top - bottom);
-    CGRect pdfViewRect = [pv convertRect:pageRect fromPage:page];
-    *outRect = [self convertRect:pdfViewRect fromView:pv];
-    return YES;
+/** Parses the "left,top,right,bottom" wire strings once per data change (setHighlightRects:/
+ *  setSkipZoneRects: below) — NSString splitting + doubleValue parsing has no reason to run
+ *  again on every -drawRect: call, which -refreshHighlightOverlayContainer triggers on every
+ *  single scroll/zoom delta (up to 60-120x/sec during a live pinch). This was found to be
+ *  real, measurable per-frame overhead contributing to the highlight lagging a live pinch —
+ *  independent of the live PDFKit geometry conversion below, which still has to run every
+ *  frame (it genuinely depends on the current zoom scale) but is now the only remaining
+ *  per-frame cost. */
+- (NSArray<RNPDFParsedRect *> *)parseRectItems:(NSArray<NSDictionary *> *)items {
+    NSMutableArray<RNPDFParsedRect *> *result = [NSMutableArray arrayWithCapacity:items.count];
+    for (NSDictionary *item in items) {
+        NSNumber *pageNum = item[@"page"];
+        NSString *rectStr = item[@"rect"];
+        if (!pageNum || !rectStr.length) continue;
+        NSArray<NSString *> *parts = [rectStr componentsSeparatedByString:@","];
+        if (parts.count != 4) continue;
+        CGFloat left = parts[0].doubleValue, top = parts[1].doubleValue, right = parts[2].doubleValue, bottom = parts[3].doubleValue;
+        RNPDFParsedRect *parsed = [RNPDFParsedRect new];
+        parsed.page = pageNum.integerValue;
+        parsed.pageRect = CGRectMake(left, bottom, right - left, top - bottom);
+        [result addObject:parsed];
+    }
+    return result;
+}
+
+- (void)setHighlightRects:(NSArray<NSDictionary *> *)highlightRects {
+    _highlightRects = [highlightRects copy];
+    self.parsedHighlightRects = [self parseRectItems:highlightRects];
+}
+
+- (void)setSkipZoneRects:(NSArray<NSDictionary *> *)skipZoneRects {
+    _skipZoneRects = [skipZoneRects copy];
+    self.parsedSkipZoneRects = [self parseRectItems:skipZoneRects];
+}
+
+/** The one part of the conversion that genuinely must run every -drawRect: — it queries
+ *  PDFKit's live, current-zoom-scale page-to-view mapping, which is the whole reason this
+ *  redraw has to happen every frame in the first place (see -refreshHighlightOverlayContainer's
+ *  comment). No string parsing left here. */
+- (CGRect)viewRectForParsedRect:(RNPDFParsedRect *)parsed onPage:(PDFPage *)page inView:(PDFView *)pv {
+    CGRect pdfViewRect = [pv convertRect:parsed.pageRect fromPage:page];
+    return [self convertRect:pdfViewRect fromView:pv];
 }
 
 - (void)drawRect:(CGRect)rect {
@@ -81,19 +125,14 @@ const float MIN_SCALE = 1.0f;
     if (!pv || !pv.document) return;
     PDFDocument *doc = pv.document;
 
-    NSArray *skipItems = self.skipZoneRects;
+    NSArray<RNPDFParsedRect *> *skipItems = self.parsedSkipZoneRects;
     if (skipItems.count) {
         CGContextRef ctx = UIGraphicsGetCurrentContext();
-        for (NSDictionary *item in skipItems) {
-            NSNumber *pageNum = item[@"page"];
-            NSString *rectStr = item[@"rect"];
-            if (!pageNum || !rectStr.length) continue;
-            int page1 = pageNum.intValue;
-            if (page1 < 1) continue;
-            PDFPage *page = [doc pageAtIndex:(NSUInteger)(page1 - 1)];
+        for (RNPDFParsedRect *parsed in skipItems) {
+            if (parsed.page < 1) continue;
+            PDFPage *page = [doc pageAtIndex:(NSUInteger)(parsed.page - 1)];
             if (!page) continue;
-            CGRect viewRect;
-            if (![self viewRect:&viewRect forPageRectString:rectStr onPage:page inView:pv]) continue;
+            CGRect viewRect = [self viewRectForParsedRect:parsed onPage:page inView:pv];
 
             CGContextSaveGState(ctx);
             CGContextClipToRect(ctx, viewRect);
@@ -114,19 +153,14 @@ const float MIN_SCALE = 1.0f;
         }
     }
 
-    NSArray *items = self.highlightRects;
+    NSArray<RNPDFParsedRect *> *items = self.parsedHighlightRects;
     if (items.count) {
         [[UIColor colorWithRed:1 green:1 blue:0 alpha:0.35] setFill];
-        for (NSDictionary *item in items) {
-            NSNumber *pageNum = item[@"page"];
-            NSString *rectStr = item[@"rect"];
-            if (!pageNum || !rectStr.length) continue;
-            int page1 = pageNum.intValue;
-            if (page1 < 1) continue;
-            PDFPage *page = [doc pageAtIndex:(NSUInteger)(page1 - 1)];
+        for (RNPDFParsedRect *parsed in items) {
+            if (parsed.page < 1) continue;
+            PDFPage *page = [doc pageAtIndex:(NSUInteger)(parsed.page - 1)];
             if (!page) continue;
-            CGRect viewRect;
-            if (![self viewRect:&viewRect forPageRectString:rectStr onPage:page inView:pv]) continue;
+            CGRect viewRect = [self viewRectForParsedRect:parsed onPage:page inView:pv];
             CGContextFillRect(UIGraphicsGetCurrentContext(), viewRect);
         }
     }
@@ -1338,6 +1372,19 @@ using namespace facebook::react;
     [container bringSubviewToFront:_highlightOverlay];
 }
 
+// REVERTED (2026-09-17): an earlier version of this function made setNeedsDisplay
+// conditional on the overlay's frame/transform actually changing, on the theory that
+// UIKit would composite container's zoom transform onto the overlay's already-drawn
+// content for free. Confirmed wrong by hands-on device testing: container.bounds stays
+// constant across zoom (that part was right), but -drawRect: below does NOT draw in a
+// stable, transform-inheriting coordinate space — it calls -convertRect:fromView: (a
+// live, zoom-aware PDFView-space query) per rect, so the drawn content is only correct
+// for the zoom scale at the moment -drawRect: last actually ran. Making setNeedsDisplay
+// conditional froze the highlight at its pre-gesture position for the whole gesture,
+// only catching up once something else (unrelated) triggered a redraw at release —
+// worse than the original lag. Back to unconditional per-delta redraw; the real fix for
+// the lag has to make -drawRect:'s per-frame work cheaper (see its own comments), not
+// skip triggering it.
 - (void)refreshHighlightOverlayContainer {
     if (!_highlightOverlay || !_pdfView) return;
 
