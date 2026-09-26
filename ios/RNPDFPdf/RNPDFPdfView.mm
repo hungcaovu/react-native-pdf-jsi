@@ -825,6 +825,8 @@ using namespace facebook::react;
             }
         }
         if (!preservedViewport) {
+            RCTLogInfo(@"📍 [iOS Scroll] goToDestination (top-left) for page swap %d -> %d (no viewport to preserve)",
+                       _page, targetPage);
             CGPoint pointLeftTop = CGPointMake(0, pdfPageRect.size.height);
             PDFDestination *pdfDest = [[PDFDestination alloc] initWithPage:pdfPage atPoint:pointLeftTop];
             [_pdfView goToDestination:pdfDest];
@@ -1181,13 +1183,26 @@ using namespace facebook::react;
 
         // Separate page navigation logic - only navigate when page prop actually changes
         // Skip navigation on initial load (when path changes) to avoid conflicts
-        BOOL shouldNavigateToPage = _documentLoaded && 
-                                     [changedProps containsObject:@"page"] && 
+        BOOL shouldNavigateToPage = _documentLoaded &&
+                                     [changedProps containsObject:@"page"] &&
                                      !_isNavigating &&
                                      _page != _previousPage &&
                                      _page > 0 &&
                                      _page <= (int)_pdfDocument.pageCount;
-        
+
+        // Bounce investigation (2026-09-17): device logs from the vision-highlight spike
+        // showed the paged view reporting pageChanged 5<->11 forever while JS's `page` prop
+        // sat on 14 (the doc's last page) the whole time, never re-triggering a fresh
+        // navigate. Log every "page" prop delivery here, including when it's skipped, so a
+        // future capture shows whether a second prop update arrived while _isNavigating was
+        // still true for the first (which would leave _previousPage stale and unable to
+        // recover) versus the currentPage genuinely oscillating inside PDFKit itself.
+        if ([changedProps containsObject:@"page"]) {
+            RCTLogInfo(@"🔁 [iOS PageProp] page=%d previousPage=%d isNavigating=%d pageTransitionState=%ld documentLoaded=%d pageCount=%lu enablePaging=%d -> shouldNavigate=%d",
+                       _page, _previousPage, _isNavigating, (long)_pageTransitionState, _documentLoaded,
+                       _pdfDocument ? (unsigned long)_pdfDocument.pageCount : 0, _enablePaging, shouldNavigateToPage);
+        }
+
         if (shouldNavigateToPage) {
             _isNavigating = YES;
             PDFPage *pdfPage = [_pdfDocument pageAtIndex:_page-1];
@@ -1585,6 +1600,12 @@ using namespace facebook::react;
         }
 
         RLog(@"Enhanced PDF: Navigated to page %d", _page);
+        // Bounce investigation (2026-09-17) — see the shouldNavigateToPage log in
+        // didSetProps: tag every PDFViewPageChangedNotification with whether we were mid
+        // programmatic navigate/transition when it fired, to tell "PDFKit's currentPage is
+        // genuinely oscillating" apart from "we kept re-triggering navigate ourselves".
+        RCTLogInfo(@"🔁 [iOS PageChanged] currentPage=%d isNavigating=%d pageTransitionState=%ld",
+                   _page, _isNavigating, (long)_pageTransitionState);
         [self notifyOnChangeWithMessage:[[NSString alloc] initWithString:[NSString stringWithFormat:@"pageChanged|%lu|%lu", page+1, numberOfPages]]];
         if (_highlightOverlay) [_highlightOverlay setNeedsDisplay];
     }
