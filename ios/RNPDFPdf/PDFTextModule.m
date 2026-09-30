@@ -229,7 +229,16 @@ RCT_EXPORT_METHOD(getPageSize:(NSString *)filePath
             return;
         }
         PDFPage *page = [doc pageAtIndex:(NSUInteger)pageIndex];
-        CGRect bounds = [page boundsForBox:kPDFDisplayBoxMediaBox];
+        // CropBox, not MediaBox: RNPDFPdfView's fit/scale math and its highlight/skip-zone
+        // overlay (HighlightOverlayView's convertRect:fromPage:) both operate against
+        // PDFKit's CropBox-based page bounds (see boundsForBox:kPDFDisplayBoxCropBox in
+        // RNPDFPdfView.mm). Returning MediaBox here silently mismatched that whenever a
+        // PDF's CropBox differs from its MediaBox (e.g. a scanned book trimmed to the
+        // printed area) — every point-space rect this JS side computes from this size
+        // (highlightRects, skipZoneRects, tap-to-seek) would then land off by the
+        // difference, even though the two boxes coincide often enough that it went
+        // unnoticed until a header/footer skip-zone overlay made the offset visible.
+        CGRect bounds = [page boundsForBox:kPDFDisplayBoxCropBox];
         resolve(@{
             @"width": @(bounds.size.width),
             @"height": @(bounds.size.height)
