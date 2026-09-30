@@ -116,7 +116,17 @@ const float MIN_SCALE = 1.0f;
  *  redraw has to happen every frame in the first place (see -refreshHighlightOverlayContainer's
  *  comment). No string parsing left here. */
 - (CGRect)viewRectForParsedRect:(RNPDFParsedRect *)parsed onPage:(PDFPage *)page inView:(PDFView *)pv {
-    CGRect pdfViewRect = [pv convertRect:parsed.pageRect fromPage:page];
+    // parsed.pageRect is in "CropBox-local" space — (0,0) at the visible page's own
+    // bottom-left — because the JS side builds it from PDFText.getPageSize, which hands
+    // back the CropBox's *size* only (see PDFTextModule.m). -convertRect:fromPage:,
+    // like every other PDFPage geometry API, expects coordinates in the page's own
+    // untranslated space, where the CropBox can start at a non-zero origin (real for a
+    // scanned/trimmed book's PDF). Skipping this offset left highlight/skip-zone rects
+    // shifted by a constant amount, top and bottom alike, once the CropBox-vs-MediaBox
+    // *size* mismatch was fixed but the CropBox's *origin* was still being ignored.
+    CGRect cropBox = [page boundsForBox:kPDFDisplayBoxCropBox];
+    CGRect pageRect = CGRectOffset(parsed.pageRect, cropBox.origin.x, cropBox.origin.y);
+    CGRect pdfViewRect = [pv convertRect:pageRect fromPage:page];
     return [self convertRect:pdfViewRect fromView:pv];
 }
 
@@ -1580,7 +1590,23 @@ using namespace facebook::react;
 
         // Update current page for preloading
         int newPage = (int)page + 1;
-        
+
+        // Initial-page bug (real repro, 2026-09-30): assigning `_pdfView.document =` above
+        // makes PDFKit synchronously default its own currentPage to page 1 and post this
+        // notification, before the "Handle initial page on document load" block in
+        // didSetProps (dispatch_async'd) has run the real navigation to the JS-requested
+        // `page` prop (e.g. 258). Without this guard, the block below stomped `_page` (still
+        // correctly holding 258) with this transient 1, corrupting the pending initial
+        // navigation — visible on device as a flash to page 1 that then bounced through an
+        // intermediate page before landing on the right one. `_previousPage == -1` is the
+        // sentinel set right when a document starts loading (see path-change handling above)
+        // and cleared by the first real page-changed report, so this only ever suppresses
+        // that one spurious pre-navigation notification, never a genuine page 1 open.
+        if (_previousPage == -1 && _page != 1 && newPage == 1) {
+            RCTLogInfo(@"⏭️ [iOS PageChanged] Ignoring transient PDFKit default-to-page-1 notification before initial navigation to page %d", _page);
+            return;
+        }
+
         // CRITICAL FIX: Update _previousPage to the new page value when page changes from PDFView notifications
         // This prevents updateProps from triggering programmatic navigation when React Native
         // receives the pageChanged notification and updates the page prop back to us.
