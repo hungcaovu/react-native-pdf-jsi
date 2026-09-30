@@ -241,12 +241,23 @@ public class PDFTextModule extends ReactContextBaseJavaModule {
 
     /**
      * Render a PDF page to an in-memory bitmap and run OCR (no temp image file).
+     *
+     * Renders via Pdfium (same engine as getPageSize above), not android.graphics.pdf.PdfRenderer
+     * (used here previously): pdfImporter.ts stores each OCR line as a *fraction* of this
+     * rendered bitmap, then multiplies that fraction by getPageSize's point-space dimensions
+     * to land a highlight rect — so the bitmap rendered here and the size getPageSize reports
+     * must come from the same box. android.graphics.pdf.PdfRenderer has no CropBox concept at
+     * all (Android/AOSP limitation) and always reflects MediaBox, while Pdfium's
+     * getPageWidthPoint/HeightPoint follows CropBox when present — mismatched whenever a PDF's
+     * CropBox differs from its MediaBox (e.g. a scanned book trimmed to the printed area),
+     * same bug as iOS's MediaBox/CropBox mismatch fixed the same day in this same file.
      */
     @ReactMethod
     public void recognizePage(String filePath, int pageIndex, ReadableMap options, Promise promise) {
         executor.execute(() -> {
             if (!ensureOcrReady(promise)) return;
             ParcelFileDescriptor pfd = null;
+            io.legere.pdfiumandroid.PdfDocument doc = null;
             Bitmap bitmap = null;
             try {
                 String path = normalizePath(filePath);
@@ -254,23 +265,23 @@ public class PDFTextModule extends ReactContextBaseJavaModule {
                 float scale = (float) Math.max(1.0, dpi / 72.0);
 
                 pfd = openPdfDescriptor(path);
-                try (PdfRenderer renderer = new PdfRenderer(pfd)) {
-                    pfd = null;
-                    if (pageIndex < 0 || pageIndex >= renderer.getPageCount()) {
-                        promise.reject("OCR_ERROR", "Page index out of range: " + pageIndex);
-                        return;
-                    }
-                    PdfRenderer.Page page = renderer.openPage(pageIndex);
-                    try {
-                        int width = Math.max(1, Math.round(page.getWidth() * scale));
-                        int height = Math.max(1, Math.round(page.getHeight() * scale));
-                        bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-                        Canvas canvas = new Canvas(bitmap);
-                        canvas.drawColor(Color.WHITE);
-                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
-                    } finally {
-                        page.close();
-                    }
+                PdfiumCore core = new PdfiumCore();
+                doc = core.newDocument(pfd);
+                int pageCount = doc.getPageCount();
+                if (pageIndex < 0 || pageIndex >= pageCount) {
+                    promise.reject("OCR_ERROR", "Page index out of range: " + pageIndex);
+                    return;
+                }
+                PdfPage page = doc.openPage(pageIndex);
+                try {
+                    int width = Math.max(1, Math.round(page.getPageWidthPoint() * scale));
+                    int height = Math.max(1, Math.round(page.getPageHeightPoint() * scale));
+                    bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                    Canvas canvas = new Canvas(bitmap);
+                    canvas.drawColor(Color.WHITE);
+                    page.renderPageBitmap(bitmap, 0, 0, width, height, false, false, 0xFF848484, Color.WHITE);
+                } finally {
+                    page.close();
                 }
 
                 WritableMap result = runMlKitOcr(bitmap);
@@ -282,6 +293,7 @@ public class PDFTextModule extends ReactContextBaseJavaModule {
                 promise.reject("OCR_ERROR", e.getMessage(), e);
             } finally {
                 recycleBitmap(bitmap);
+                closeDoc(doc);
                 closeQuietly(pfd);
             }
         });

@@ -73,7 +73,14 @@ RCT_EXPORT_MODULE(PDFTextModule);
 }
 
 - (UIImage *)renderPageImage:(PDFPage *)page dpi:(CGFloat)dpi {
-    CGRect pageRect = [page boundsForBox:kPDFDisplayBoxMediaBox];
+    // CropBox, not MediaBox: pdfImporter.ts stores each OCR line as a *fraction* of this
+    // rendered image, then multiplies that fraction by getPageSize's dimensions (CropBox,
+    // see the comment there) to land in point space — so the box rendered here has to be
+    // the same box getPageSize measures. Rendering MediaBox here while getPageSize returns
+    // CropBox let every OCR-derived highlight rect drift on any scanned PDF where CropBox
+    // is inset from MediaBox (trimmed scan margins) — found 2026-09-30 right after the
+    // getPageSize fix, verifying highlight position on a real device.
+    CGRect pageRect = [page boundsForBox:kPDFDisplayBoxCropBox];
     CGFloat scale = MAX(1.0, dpi / 72.0);
     CGSize imageSize = CGSizeMake(pageRect.size.width * scale, pageRect.size.height * scale);
     UIGraphicsBeginImageContextWithOptions(imageSize, YES, 1.0);
@@ -81,7 +88,16 @@ RCT_EXPORT_MODULE(PDFTextModule);
     [[UIColor whiteColor] setFill];
     CGContextFillRect(ctx, CGRectMake(0, 0, imageSize.width, imageSize.height));
     CGContextScaleCTM(ctx, scale, scale);
-    [page drawWithBox:kPDFDisplayBoxMediaBox toContext:ctx];
+    // -drawWithBox: draws in the page's own untranslated coordinate space (same gotcha as
+    // -convertRect:fromPage: in RNPDFPdfView.mm) — it does NOT shift content so the box's
+    // origin lands at the context's (0,0) on its own. Without this, a CropBox with a
+    // non-zero origin.x (real for a scanned PDF trimmed off-center) draws shifted right by
+    // that many points inside a canvas already sized to CropBox's width, clipping that same
+    // amount off the right edge and leaving a blank strip on the left — Vision then only
+    // ever sees a horizontally truncated line, so every highlight rect built from its boxes
+    // reads narrower than the real line width.
+    CGContextTranslateCTM(ctx, -pageRect.origin.x, -pageRect.origin.y);
+    [page drawWithBox:kPDFDisplayBoxCropBox toContext:ctx];
     UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return image;
