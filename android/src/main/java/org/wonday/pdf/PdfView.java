@@ -19,9 +19,12 @@ import android.util.Log;
 import android.net.Uri;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Shader;
 import android.os.Handler;
 
 import com.facebook.react.bridge.ReadableArray;
@@ -182,8 +185,9 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
 
     /** Header/footer skip-zone bands — same shape/units as highlightRects, drawn as a hatch instead of a solid fill. */
     private List<HighlightRect> skipZoneRects = new ArrayList<>();
-    private static final int SKIP_ZONE_TINT_COLOR = Color.argb(56, 128, 128, 128);
-    private static final int SKIP_ZONE_HATCH_COLOR = Color.argb(140, 64, 64, 64);
+    // ~20% more transparent than the original 56/140 alphas (2026-09-30 follow-up).
+    private static final int SKIP_ZONE_TINT_COLOR = Color.argb(45, 128, 128, 128);
+    private static final int SKIP_ZONE_HATCH_COLOR = Color.argb(112, 64, 64, 64);
     private final Paint skipZoneTintPaint = new Paint();
     private final Paint skipZoneHatchPaint = new Paint();
 
@@ -194,9 +198,16 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         highlightPaint.setStyle(Paint.Style.FILL);
         skipZoneTintPaint.setColor(SKIP_ZONE_TINT_COLOR);
         skipZoneTintPaint.setStyle(Paint.Style.FILL);
+        // FILL + a tiled BitmapShader (built once, see buildSkipZoneHatchShader below) instead
+        // of a per-frame loop of canvas.drawLine calls (as this used to be): onLayerDrawn runs
+        // on every zoom/pan delta same as iOS's -drawRect:, and stroking dozens of individual
+        // lines into a full-width header/footer band on every one of those frames was real,
+        // visible lag — the hatch fell behind the page during a live pinch, unlike the single
+        // canvas.drawRect used for highlightRects, which never showed the same lag (iOS hit
+        // the identical issue and fix — see RNPDFPdfView.mm's skipZoneHatchTile).
         skipZoneHatchPaint.setColor(SKIP_ZONE_HATCH_COLOR);
-        skipZoneHatchPaint.setStyle(Paint.Style.STROKE);
-        skipZoneHatchPaint.setStrokeWidth(3);
+        skipZoneHatchPaint.setStyle(Paint.Style.FILL);
+        skipZoneHatchPaint.setShader(buildSkipZoneHatchShader());
     }
 
     /** Entry for one highlight: page (1-based) and rect in PDF points "left,top,right,bottom". */
@@ -550,13 +561,36 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         canvas.save();
         canvas.clipRect(left, top, right, bottom);
         canvas.drawRect(left, top, right, bottom, skipZoneTintPaint);
-        canvas.translate((left + right) / 2f, (top + bottom) / 2f);
-        canvas.rotate(45);
-        float diag = (float) Math.hypot(right - left, bottom - top);
-        for (float x = -diag; x <= diag; x += 9) {
-            canvas.drawLine(x, -diag, x, diag, skipZoneHatchPaint);
-        }
+        canvas.drawRect(left, top, right, bottom, skipZoneHatchPaint);
         canvas.restore();
+    }
+
+    /**
+     * Builds a small tileable diagonal-stripe bitmap once and wraps it in a repeating
+     * BitmapShader, so drawSkipZoneHatch above can fill a rect with a single canvas.drawRect
+     * instead of looping canvas.drawLine per 9px step every frame. A 45°, 9px-spaced line grid
+     * is periodic with period 9*sqrt(2) along both axes of an unrotated tile (the projection of
+     * the rotated-frame spacing onto each axis), so a square tile of exactly that side, with one
+     * diagonal line drawn across it, reproduces the identical infinite pattern when tiled — same
+     * look as the old per-frame stroke loop, O(1) draw calls per rect instead of O(height / 9).
+     */
+    private static Shader buildSkipZoneHatchShader() {
+        float side = (float) (9.0 * Math.sqrt(2));
+        int sizePx = Math.round(side);
+        Bitmap tile = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
+        Canvas tileCanvas = new Canvas(tile);
+        Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        linePaint.setColor(SKIP_ZONE_HATCH_COLOR);
+        linePaint.setStyle(Paint.Style.STROKE);
+        linePaint.setStrokeWidth(3);
+        tileCanvas.translate(sizePx / 2f, sizePx / 2f);
+        tileCanvas.rotate(45);
+        float diag = sizePx; // generous vs. the post-rotation half-diagonal, so corners are fully covered
+        for (float x = -diag; x <= diag; x += 9) {
+            tileCanvas.drawLine(x, -diag, x, diag, linePaint);
+        }
+        BitmapShader shader = new BitmapShader(tile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT);
+        return shader;
     }
 
     @Override
