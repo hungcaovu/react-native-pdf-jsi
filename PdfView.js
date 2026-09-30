@@ -111,6 +111,24 @@ export default class PdfView extends Component {
                         pageAspectRate: pageAspectRatio,
                         pdfPageSize: {width, height},
                         centerContent: numberOfPages > 1 ? false : true
+                    }, () => {
+                        // Jump to the requested initial page now that the FlatList's `data`
+                        // array actually has `numberOfPages` items. The old code instead did
+                        // this on a fixed 200ms timer started at mount time, which races
+                        // PdfManager.loadFile() on large PDFs: if loadFile takes longer than
+                        // 200ms, scrollToIndex ran against a still-empty list and silently
+                        // no-opped, stranding the view on page 1 forever with nothing left to
+                        // retrigger it (real repro, 2026-09-30: opening a 516-page PDF at page
+                        // 258 left the view showing the cover while the page counter, driven
+                        // by separate React state, correctly read 258).
+                        if (this._flatList && this.props.page > 1) {
+                            const initialPage = Math.min(this.props.page, numberOfPages) - 1;
+                            this._flatList.scrollToIndex({
+                                animated: false,
+                                index: initialPage
+                            });
+                        }
+                        this.setState({ previousPage: this.props.page < 1 ? 1 : this.props.page });
                     });
                     if (this.props.onLoadComplete) {
                         this.props.onLoadComplete(numberOfPages, this.props.path, {width, height});
@@ -121,19 +139,6 @@ export default class PdfView extends Component {
             .catch((error) => {
                 this.props.onError(error);
             });
-
-        // Initialize page navigation after PDF loads
-        clearTimeout(this._scrollTimer);
-        this._scrollTimer = setTimeout(() => {
-            if (this._flatList && this._mounted) {
-                const initialPage = this.props.page < 1 ? 0 : this.props.page - 1;
-                this._flatList.scrollToIndex({
-                    animated: false, 
-                    index: initialPage
-                });
-                this.setState({ previousPage: this.props.page < 1 ? 1 : this.props.page });
-            }
-        }, 200);
     }
 
     componentDidUpdate(prevProps) {
