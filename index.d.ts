@@ -636,7 +636,16 @@ export interface PDFTextManager {
     isAvailable(): boolean;
     isOCRAvailable(): Promise<boolean>;
     getCapabilities(): Promise<PDFTextCapabilities>;
-    getPageSize(filePath: string, pageIndex0: number): Promise<{ width: number; height: number }>;
+    getPageSize(filePath: string, pageIndex0: number): Promise<{
+        width: number;
+        height: number;
+        mediaWidth: number;
+        mediaHeight: number;
+        mediaOriginX: number;
+        mediaOriginY: number;
+        cropOriginX: number;
+        cropOriginY: number;
+    }>;
     extract(filePath: string, options?: PDFTextExtractOptions): Promise<PDFTextExtractResult>;
     makeSearchablePDF(inputPath: string, options?: PDFTextMakeSearchableOptions): Promise<PDFTextSearchableResult>;
     toHighlightRects(filePath: string, pageMeta: Map<number, PDFTextPageMeta> | object): Promise<PDFHighlightRect[]>;

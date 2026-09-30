@@ -255,9 +255,29 @@ RCT_EXPORT_METHOD(getPageSize:(NSString *)filePath
         // difference, even though the two boxes coincide often enough that it went
         // unnoticed until a header/footer skip-zone overlay made the offset visible.
         CGRect bounds = [page boundsForBox:kPDFDisplayBoxCropBox];
+        // mediaBounds + both boxes' own origin: the OCR library the app uses
+        // (@dariyd/react-native-text-recognition, not this fork) normalizes its line boxes
+        // against MediaBox, not CropBox — a second, separate mismatch from the one this
+        // function's CropBox switch fixed above. That library can't be made CropBox-aware
+        // on Android (android.graphics.pdf.PdfRenderer has no CropBox concept at all), so
+        // the fix lives on the JS side instead (pdfImporter.ts rebases each OCR box from
+        // MediaBox into CropBox-relative fractions before using it). Both boxes' .origin
+        // are needed, not just CropBox's — JS's first attempt at this (2026-09-30) assumed
+        // MediaBox's own origin was (0,0) and only asked for CropBox's origin, which
+        // over-excluded lines on any PDF where MediaBox itself doesn't start at the page's
+        // native (0,0) (real, caught the same day: import excluded more than the drawn
+        // band). Both origins live in the same untranslated page space, so JS can subtract
+        // one absolute point from the other directly once it has both.
+        CGRect mediaBounds = [page boundsForBox:kPDFDisplayBoxMediaBox];
         resolve(@{
             @"width": @(bounds.size.width),
-            @"height": @(bounds.size.height)
+            @"height": @(bounds.size.height),
+            @"mediaWidth": @(mediaBounds.size.width),
+            @"mediaHeight": @(mediaBounds.size.height),
+            @"mediaOriginX": @(mediaBounds.origin.x),
+            @"mediaOriginY": @(mediaBounds.origin.y),
+            @"cropOriginX": @(bounds.origin.x),
+            @"cropOriginY": @(bounds.origin.y)
         });
     });
 }

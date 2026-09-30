@@ -11,6 +11,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.pdf.PdfDocument;
 import android.graphics.pdf.PdfRenderer;
 import android.net.Uri;
@@ -130,6 +131,29 @@ public class PDFTextModule extends ReactContextBaseJavaModule {
                     WritableMap size = Arguments.createMap();
                     size.putDouble("width", page.getPageWidthPoint());
                     size.putDouble("height", page.getPageHeightPoint());
+                    // mediaBox size+origin + CropBox's own origin (left, bottom — PDFium's
+                    // native box order is left/bottom/right/top, y-up, same convention iOS's
+                    // PDFTextModule.m returns via CGRect.origin/size): the OCR library the app
+                    // actually uses for text extraction (@dariyd/react-native-text-recognition,
+                    // a separate dependency from this fork) normalizes its line boxes against
+                    // MediaBox, not CropBox, and can't be made CropBox-aware on Android at all
+                    // (android.graphics.pdf.PdfRenderer, which that library renders through, has
+                    // no CropBox concept — an AOSP limitation this fork hit itself and worked
+                    // around by switching to Pdfium instead, see StreamingPDFProcessor.m's iOS
+                    // comment). So the OCR-to-CropBox rebasing has to happen JS-side
+                    // (pdfImporter.ts). Both boxes' own origin are needed, not just CropBox's —
+                    // the first attempt at this (2026-09-30) assumed MediaBox itself starts at
+                    // the page's native (0,0) and only sent CropBox's origin, which
+                    // over-excluded header/footer lines on any PDF where MediaBox doesn't start
+                    // at (0,0) (real, caught the same day testing on a real device).
+                    RectF cropBox = page.getPageCropBox();
+                    RectF mediaBox = page.getPageMediaBox();
+                    size.putDouble("mediaWidth", mediaBox.right - mediaBox.left);
+                    size.putDouble("mediaHeight", mediaBox.top - mediaBox.bottom);
+                    size.putDouble("mediaOriginX", mediaBox.left);
+                    size.putDouble("mediaOriginY", mediaBox.bottom);
+                    size.putDouble("cropOriginX", cropBox.left);
+                    size.putDouble("cropOriginY", cropBox.bottom);
                     promise.resolve(size);
                 } finally {
                     page.close();
