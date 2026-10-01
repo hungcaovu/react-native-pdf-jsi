@@ -344,6 +344,11 @@ typedef NS_ENUM(NSInteger, RNPDFPageTransitionState) {
     RNPDFScrollViewDelegateProxy *_scrollDelegateProxy;
     PDFOutline *root;
     float _fixScaleFactor;
+    // Set true for the duration of a live two-finger pinch (scrollViewWillBeginZooming/
+    // scrollViewDidEndZooming below). Guards the `scale` prop re-application in
+    // updateProps: — see that call site for why forcing scaleFactor while this is YES
+    // causes the zoom to visibly judder.
+    BOOL _isLiveZooming;
     bool _initialed;
     NSArray<NSString *> *_changedProps;
     UITapGestureRecognizer *_doubleTapRecognizer;
@@ -735,6 +740,7 @@ using namespace facebook::react;
     _fixScaleFactor = -1.0f;
     _initialed = NO;
     _changedProps = NULL;
+    _isLiveZooming = NO;
 
     [self addSubview:_pdfView];
 
@@ -1150,11 +1156,19 @@ using namespace facebook::react;
 
         }
 
-        if (_pdfDocument && ([effectiveChangedProps containsObject:@"path"] || [changedProps containsObject:@"scale"])) {
+        // Skip while a live pinch is in progress: `scale` here is JS echoing back
+        // whatever onScaleChanged/scrollViewDidZoom last told it, round-tripped through
+        // the bridge. By the time that round trip lands, the user's fingers (and the
+        // scroll view's own live zoomScale) have already moved past the echoed value —
+        // forcing scaleFactor/zoomScale back to that stale number here fights the
+        // in-progress UIPinchGestureRecognizer every single frame, which is what reads
+        // as the PDF juddering while the user holds a pinch. The live gesture is already
+        // the source of truth during this window; nothing needs to be applied until it ends.
+        if (_pdfDocument && !_isLiveZooming && ([effectiveChangedProps containsObject:@"path"] || [changedProps containsObject:@"scale"])) {
             _pdfView.scaleFactor = _scale * _fixScaleFactor;
             if (_pdfView.scaleFactor>_pdfView.maxScaleFactor) _pdfView.scaleFactor = _pdfView.maxScaleFactor;
             if (_pdfView.scaleFactor<_pdfView.minScaleFactor) _pdfView.scaleFactor = _pdfView.minScaleFactor;
-            
+
             // Also update internal scroll view zoom scale when scale changes
             if (_internalScrollView && _fixScaleFactor > 0) {
                 _internalScrollView.zoomScale = _pdfView.scaleFactor;
@@ -2287,6 +2301,7 @@ using namespace facebook::react;
 }
 
 - (void)scrollViewWillBeginZooming:(UIScrollView *)scrollView withView:(UIView *)view {
+    _isLiveZooming = YES;
     if (_highlightOverlay) {
         [self refreshHighlightOverlayContainer];
     }
@@ -2296,6 +2311,13 @@ using namespace facebook::react;
 - (void)scrollViewDidEndZooming:(UIScrollView *)scrollView
                         withView:(UIView *)view
                          atScale:(CGFloat)scale {
+    _isLiveZooming = NO;
+    // The gesture just ended; resync the cached scale from the view's real, final
+    // scaleFactor so the next JS round trip's echoed `scale` prop is a no-op instead
+    // of (harmlessly, but needlessly) re-applying a value that's already current.
+    if (_fixScaleFactor > 0 && _pdfView.scaleFactor > 0) {
+        _scale = _pdfView.scaleFactor / _fixScaleFactor;
+    }
     if (_highlightOverlay) {
         [self refreshHighlightOverlayContainer];
     }
