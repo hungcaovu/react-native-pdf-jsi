@@ -19,6 +19,7 @@ import android.util.Log;
 import android.net.Uri;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
+import android.view.GestureDetector;
 import android.graphics.Bitmap;
 import android.graphics.BitmapShader;
 import android.graphics.Canvas;
@@ -104,6 +105,45 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
     // animation duration, so this rarely has to be the thing that resolves it.
     private static final long PAGE_TRANSITION_SETTLE_TIMEOUT_MS = 400;
 
+    // The underlying AndroidPdfViewer library only exposes a confirmed single
+    // tap via OnTapListener (its own internal GestureDetector swallows the
+    // double tap for its zoom cycling, see PdfManager's enableDoubletap).
+    // There's no library hook for "a double tap happened", so we run our own
+    // GestureDetector in parallel purely to observe and report it to JS -
+    // it never calls requestDisallowInterceptTouchEvent or otherwise
+    // consumes the stream, so it can't interfere with the library's own
+    // gesture handling (pan/pinch/its double-tap-zoom all still work as
+    // today; see mirrors onDoubleTap in iOS's handleDoubleTap:).
+    private final GestureDetector doubleTapDetector = new GestureDetector(getContext(), new GestureDetector.SimpleOnGestureListener() {
+        @Override
+        public boolean onDoubleTap(MotionEvent e) {
+            // Same end-of-swipe guard as onTap below - a double tap landing
+            // while a page transition is still settling is the tail of a
+            // swipe, not a deliberate double tap.
+            if (pageTransitionState != PAGE_TRANSITION_IDLE) {
+                showLog(format("onDoubleTap: ignoring - page transition state=%d (not Idle)", pageTransitionState));
+                return true;
+            }
+            emitTapMessage("pageDoubleTap", e.getX(), e.getY());
+            return true;
+        }
+    });
+
+    private void emitTapMessage(String type, float x, float y) {
+        WritableMap event = Arguments.createMap();
+        event.putString("message", type + "|" + page + "|" + x + "|" + y);
+
+        ThemedReactContext context = (ThemedReactContext) getContext();
+        EventDispatcher dispatcher = UIManagerHelper.getEventDispatcherForReactTag(context, getId());
+        int surfaceId = UIManagerHelper.getSurfaceId(this);
+
+        TopChangeEvent tce = new TopChangeEvent(surfaceId, getId(), event);
+
+        if (dispatcher != null) {
+            dispatcher.dispatchEvent(tce);
+        }
+    }
+
     private void beginSettlingAfterUserGestureEnd() {
         pageTransitionState = PAGE_TRANSITION_SETTLING;
         final int generation = ++pageTransitionGeneration;
@@ -120,6 +160,7 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
 
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
+        doubleTapDetector.onTouchEvent(event);
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 pageTransitionState = PAGE_TRANSITION_USER_DRIVEN;
@@ -441,24 +482,7 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
         //Constants.Pinch.MINIMUM_ZOOM = this.minScale;
         //Constants.Pinch.MAXIMUM_ZOOM = this.maxScale;
 
-        WritableMap event = Arguments.createMap();
-        event.putString("message", "pageSingleTap|"+page+"|"+e.getX()+"|"+e.getY());
-
-        ThemedReactContext context = (ThemedReactContext) getContext();
-        EventDispatcher dispatcher = UIManagerHelper.getEventDispatcherForReactTag(context, getId());
-        int surfaceId = UIManagerHelper.getSurfaceId(this);
-
-        TopChangeEvent tce = new TopChangeEvent(surfaceId, getId(), event);
-
-        if (dispatcher != null) {
-            dispatcher.dispatchEvent(tce);
-        }
-//        ReactContext reactContext = (ReactContext)this.getContext();
-//        reactContext.getJSModule(RCTEventEmitter.class).receiveEvent(
-//            this.getId(),
-//            "topChange",
-//            event
-//         );
+        emitTapMessage("pageSingleTap", e.getX(), e.getY());
 
         // process as tap
          return true;

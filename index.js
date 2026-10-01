@@ -66,6 +66,7 @@ export default class Pdf extends Component {
         onPageChanged: PropTypes.func,
         onError: PropTypes.func,
         onPageSingleTap: PropTypes.func,
+        onPageDoubleTap: PropTypes.func,
         onScaleChanged: PropTypes.func,
         onPressLink: PropTypes.func,
         pdfId: PropTypes.string,
@@ -110,6 +111,8 @@ export default class Pdf extends Component {
         onError: (error) => {
         },
         onPageSingleTap: (page, x, y) => {
+        },
+        onPageDoubleTap: (page, x, y) => {
         },
         onScaleChanged: (scale) => {
         },
@@ -669,6 +672,8 @@ export default class Pdf extends Component {
                 this._onError(new Error(message[1]));
             } else if (message[0] === 'pageSingleTap') {
                 this.props.onPageSingleTap && this.props.onPageSingleTap(Number(message[1]), Number(message[2]), Number(message[3]));
+            } else if (message[0] === 'pageDoubleTap') {
+                this.props.onPageDoubleTap && this.props.onPageDoubleTap(Number(message[1]), Number(message[2]), Number(message[3]));
             } else if (message[0] === 'scaleChanged') {
                 this.props.onScaleChanged && this.props.onScaleChanged(Number(message[1]));
             } else if (message[0] === 'linkPressed') {

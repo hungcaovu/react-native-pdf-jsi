@@ -1866,13 +1866,6 @@ using namespace facebook::react;
         [self->_pdfView clearSelection];
     });
 
-    // Event appears to be consumed; broadcast for JS.
-    // _onChange(@{ @"message": @"pageDoubleTap" });
-
-    if (!_enableDoubleTapZoom) {
-        return;
-    }
-
     // A double tap can land at the tail of an in-flight finger-driven page
     // swipe in paging mode, just like the single tap this same guard
     // protects below (see handleSingleTap: and the _pageTransitionState
@@ -1883,8 +1876,27 @@ using namespace facebook::react;
     // didEndManualScroll:... -> abort()); this was the one call site still
     // missing that guard as of the 2026-09-17 recurrence.
     if (_pageTransitionState != RNPDFPageTransitionIdle) {
-        RCTLogInfo(@"👆 [iOS Scroll] Ignoring double tap zoom - page transition state=%ld (not Idle)",
+        RCTLogInfo(@"👆 [iOS Scroll] Ignoring double tap - page transition state=%ld (not Idle)",
                    (long)_pageTransitionState);
+        return;
+    }
+
+    // Broadcast for JS same as handleSingleTap: below, so tap-to-play can be
+    // driven off a double tap instead of a single tap — a double tap is a
+    // much more deliberate gesture than a single tap, which is easily
+    // misfired by the trailing edge of a swipe (see the pageSingleTap guard
+    // comment above). Reported unconditionally, even when _enableDoubleTapZoom
+    // is off, since JS may use double tap purely for tap-to-play with zoom
+    // disabled.
+    CGPoint tapPointInSelf = [recognizer locationInView:self];
+    PDFPage *tappedPdfPageForEvent = [_pdfView pageForPoint:tapPointInSelf nearest:NO];
+    if (tappedPdfPageForEvent) {
+        unsigned long pageForEvent = [_pdfDocument indexForPage:tappedPdfPageForEvent];
+        [self notifyOnChangeWithMessage:
+         [[NSString alloc] initWithString:[NSString stringWithFormat:@"pageDoubleTap|%lu|%f|%f", pageForEvent+1, tapPointInSelf.x, tapPointInSelf.y]]];
+    }
+
+    if (!_enableDoubleTapZoom) {
         return;
     }
 
