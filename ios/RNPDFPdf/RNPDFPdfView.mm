@@ -579,21 +579,36 @@ using namespace facebook::react;
             RCTLogInfo(@"✅ [iOS] SearchRegistry registered path for pdfId: %@ (from updateProps)", _pdfId);
         }
     }
-    // Convert codegen vector of {page, rect} to NSArray for setHighlightRects
+    // Convert codegen vector of {page, rect} to NSArray for setHighlightRects.
+    // Only mark it "changed" (and re-set it) when the content actually
+    // differs from last time -- this used to be unconditional, so EVERY
+    // updateProps call (even one solely about an unrelated prop like `page`
+    // mirroring back what native itself just reported) made didSetProps
+    // think highlightRects had changed, which kept its unconditional
+    // layoutDocumentView call firing on every round trip. See the
+    // layoutDocumentView gating in didSetProps below for the other half of
+    // this fix.
     NSMutableArray *newHighlightRects = [NSMutableArray array];
     for (const auto &item : newProps.highlightRects) {
       [newHighlightRects addObject:@{ @"page": @(item.page), @"rect": [NSString stringWithUTF8String:item.rect.c_str()] }];
     }
-    [self setHighlightRects:[newHighlightRects copy]];
-    [updatedPropNames addObject:@"highlightRects"];
+    NSArray *copiedHighlightRects = [newHighlightRects copy];
+    if (![_highlightRects isEqualToArray:copiedHighlightRects]) {
+        [self setHighlightRects:copiedHighlightRects];
+        [updatedPropNames addObject:@"highlightRects"];
+    }
 
-    // Convert codegen vector of {page, rect} to NSArray for setSkipZoneRects
+    // Convert codegen vector of {page, rect} to NSArray for setSkipZoneRects.
+    // Same unconditional-diff fix as highlightRects above.
     NSMutableArray *newSkipZoneRects = [NSMutableArray array];
     for (const auto &item : newProps.skipZoneRects) {
       [newSkipZoneRects addObject:@{ @"page": @(item.page), @"rect": [NSString stringWithUTF8String:item.rect.c_str()] }];
     }
-    [self setSkipZoneRects:[newSkipZoneRects copy]];
-    [updatedPropNames addObject:@"skipZoneRects"];
+    NSArray *copiedSkipZoneRects = [newSkipZoneRects copy];
+    if (![_skipZoneRects isEqualToArray:copiedSkipZoneRects]) {
+        [self setSkipZoneRects:copiedSkipZoneRects];
+        [updatedPropNames addObject:@"skipZoneRects"];
+    }
 
     [super updateProps:props oldProps:oldProps];
     [self didSetProps:updatedPropNames];
@@ -1335,7 +1350,36 @@ using namespace facebook::react;
         }
 
         _pdfView.backgroundColor = [UIColor clearColor];
-        [_pdfView layoutDocumentView];
+        // Page-boundary bounce investigation (2026-10-01): this used to call
+        // layoutDocumentView unconditionally on every didSetProps, no matter
+        // which prop changed. Combined with highlightRects/skipZoneRects
+        // previously always being reported "changed" above (now fixed), that
+        // meant a page sitting near a page boundary (e.g. a short cover page)
+        // could get nudged back and forth forever: JS mirrors native's own
+        // pageChanged report down as the `page` prop -> that round trip alone
+        // re-ran a full layoutDocumentView -> PDFKit's own currentPage
+        // determination flipped again at the ambiguous boundary -> another
+        // pageChanged notification -> JS mirrors again. Real page navigation
+        // (shouldNavigateToPage above, and the initial-page block, both gated
+        // on "path") already calls goToDestination:/goToRect:onPage:, which
+        // does its own layout -- this call was only ever needed for the
+        // geometry-affecting props below. highlightRects/skipZoneRects
+        // explicitly don't need it: their own setters already redraw the
+        // highlight overlay independently (see setHighlightRects/
+        // setSkipZoneRects).
+        static NSSet<NSString *> *geometryAffectingProps;
+        static dispatch_once_t geometryPropsOnceToken;
+        dispatch_once(&geometryPropsOnceToken, ^{
+            geometryAffectingProps = [NSSet setWithArray:@[
+                @"path", @"horizontal", @"singlePage", @"spacing", @"enableRTL",
+                @"fitPolicy", @"minScale", @"maxScale", @"scrollEnabled",
+                @"showsHorizontalScrollIndicator", @"showsVerticalScrollIndicator",
+                @"enablePaging", @"scale",
+            ]];
+        });
+        if ([geometryAffectingProps intersectsSet:[NSSet setWithArray:effectiveChangedProps]]) {
+            [_pdfView layoutDocumentView];
+        }
         [self setNeedsDisplay];
     }
 }
