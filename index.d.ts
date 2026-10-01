@@ -84,6 +84,14 @@ export interface PdfProps {
     onLoadProgress?: (percent: number,) => void,
     onLoadComplete?: (numberOfPages: number, path: string, size: {height: number, width: number}, tableContents?: TableContent[]) => void,
     onPageChanged?: (page: number, numberOfPages: number) => void,
+    /**
+     * Continuous-scroll (singlePage=false) only: fires whenever a different page
+     * becomes the one covering at least 50% of the viewport, based on actual
+     * scroll position. Display-only — unlike onPageChanged, this is not PDFKit's
+     * own (laggier) currentPage notification, and is meant for UI page indicators
+     * rather than driving navigation/the `page` prop.
+     */
+    onDisplayPageChanged?: (page: number, numberOfPages: number) => void,
     onError?: (error: object) => void,
     onPageSingleTap?: (page: number, x: number, y: number) => void,
     onScaleChanged?: (scale: number) => void,

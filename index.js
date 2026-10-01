@@ -663,6 +663,8 @@ export default class Pdf extends Component {
                 message[4] = message.splice(4).join('|');
             } else if (message[0] === 'pageChanged') {
                 this.props.onPageChanged && this.props.onPageChanged(Number(message[1]), Number(message[2]));
+            } else if (message[0] === 'displayPageChanged') {
+                this.props.onDisplayPageChanged && this.props.onDisplayPageChanged(Number(message[1]), Number(message[2]));
             } else if (message[0] === 'error') {
                 this._onError(new Error(message[1]));
             } else if (message[0] === 'pageSingleTap') {

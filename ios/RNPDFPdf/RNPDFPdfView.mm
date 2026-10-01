@@ -375,6 +375,12 @@ typedef NS_ENUM(NSInteger, RNPDFPageTransitionState) {
     int _previousPage;
     BOOL _isNavigating;
     BOOL _documentLoaded;
+    // Continuous-scroll-only "which page is actually on screen" tracker, display
+    // purposes only (see updateDisplayPageForScrollIfNeeded below) — deliberately
+    // never written back into _page/_previousPage or any navigation call, so a
+    // transient bad reading here can't trigger the "drag jumps through many
+    // pages" regression scrollViewDidScroll: above was gutted to avoid.
+    int _displayPage;
     // Three-state gesture/transition tracker, replacing a plain "_isUserScrolling"
     // bool. The old bool flipped to NO the instant scrollViewDidEndDragging:/
     // scrollViewDidEndDecelerating: fired — but those UIScrollViewDelegate calls
@@ -1619,7 +1625,12 @@ using namespace facebook::react;
             // If page didn't actually change, just ensure _previousPage matches to prevent navigation
             _previousPage = _page;
         }
-        
+        // Keep the display-only scroll tracker (see updateDisplayPageForScrollIfNeeded)
+        // in sync with the authoritative source whenever it fires — e.g. paging-mode
+        // swipes, or a programmatic jump — so it doesn't drift and isn't left stale
+        // from before this document/mode was active.
+        _displayPage = _page;
+
         _pageCount = (int)numberOfPages;
         if (_enablePreloading) {
             [self preloadAdjacentPages:_page];
@@ -2023,7 +2034,83 @@ using namespace facebook::react;
     // updateProps loop-guard (_page != _previousPage) no longer matched and a real
     // goToDestination: fired to the wrong page and then back — the actual cause of
     // "drag jumps through many pages" reported for continuous-scroll mode. Removed;
-    // PDFViewPageChangedNotification is the sole page-change source now.
+    // PDFViewPageChangedNotification is the sole source for the _page/navigation
+    // state now.
+    //
+    // updateDisplayPageForScrollIfNeeded below is a *different* signal added later
+    // (2026-10-01): PDFKit's own currentPage lags noticeably in continuous mode —
+    // e.g. dragging fast from the last page back up to page 1 can leave
+    // _pdfView.currentPage (and the pageChanged notification above) stuck on the old
+    // page long after page 1 is what's actually on screen, so the JS page-indicator
+    // chip shows a stale number. It is display-only: it feeds a separate
+    // "displayPageChanged" message that JS never writes back into the `page` prop,
+    // so it cannot re-trigger the navigation feedback loop described above even if a
+    // single frame's reading is briefly wrong.
+    [self updateDisplayPageForScrollIfNeeded];
+}
+
+// Finds whichever visible page covers at least half the viewport's height and, if
+// that's a different page than last reported, sends a display-only
+// "displayPageChanged" message. Intentionally never touches _page/_previousPage —
+// see the comment in scrollViewDidScroll: above.
+//
+// Must gate on _enablePaging, NOT _singlePage: _singlePage is an unrelated prop
+// (pdf-reader never sets it, so it's always NO) left over from this function's
+// scrollViewDidScroll:-level guard above, which only ever mattered when that
+// function's body was empty. Gating on it here let this run during a paged-mode
+// page-turn animation too — UIPageViewController's turn is itself a scroll, so
+// every frame of the transition briefly has two pages each covering ~50%,
+// flipping back and forth and firing a flood of displayPageChanged events. JS
+// setState-ing on every one of those triggered React's "Maximum update depth
+// exceeded" the first time paged mode was exercised after this was added
+// (2026-10-01). shouldUsePageViewController (see didSetProps) is the actual
+// paged/continuous source of truth elsewhere in this file; mirror it here.
+- (void)updateDisplayPageForScrollIfNeeded {
+    BOOL usingPageViewController = _enablePaging && !_horizontal;
+    if (!_pdfDocument || usingPageViewController) {
+        return;
+    }
+    NSArray<PDFPage *> *visiblePages = _pdfView.visiblePages;
+    if (visiblePages.count == 0) {
+        return;
+    }
+    CGRect viewportBounds = _pdfView.bounds;
+    if (viewportBounds.size.height <= 0) {
+        return;
+    }
+
+    PDFPage *bestPage = nil;
+    CGFloat bestFraction = 0;
+    for (PDFPage *candidatePage in visiblePages) {
+        CGRect pageBoundsInView = [_pdfView convertRect:[candidatePage boundsForBox:kPDFDisplayBoxCropBox]
+                                                fromPage:candidatePage];
+        if (pageBoundsInView.size.height <= 0) {
+            continue;
+        }
+        CGRect visibleIntersection = CGRectIntersection(pageBoundsInView, viewportBounds);
+        if (CGRectIsNull(visibleIntersection)) {
+            continue;
+        }
+        CGFloat fraction = visibleIntersection.size.height / pageBoundsInView.size.height;
+        if (fraction > bestFraction) {
+            bestFraction = fraction;
+            bestPage = candidatePage;
+        }
+    }
+    // Require a clear majority (>=50%) before switching — a page straddling the
+    // viewport boundary with ~40/60 split against its neighbor should keep
+    // reporting whichever page last won, not flicker between the two.
+    if (!bestPage || bestFraction < 0.5) {
+        return;
+    }
+
+    unsigned long pageIndex = [_pdfDocument indexForPage:bestPage];
+    int newDisplayPage = (int)pageIndex + 1;
+    if (newDisplayPage != _displayPage) {
+        _displayPage = newDisplayPage;
+        [self notifyOnChangeWithMessage:[[NSString alloc] initWithString:
+            [NSString stringWithFormat:@"displayPageChanged|%d|%lu", _displayPage, (unsigned long)_pdfDocument.pageCount]]];
+    }
 }
 
 // Marks the gesture Settling (not yet Idle) and, after one extra run-loop
@@ -2032,21 +2119,54 @@ using namespace facebook::react;
 // UIKit's own synchronous transition-cleanup call stack (the one that invoked
 // the scrollViewDidEndDragging:/scrollViewDidEndDecelerating: we're called
 // from) has fully returned before anything treats the view as Idle again.
+//
+// Paged mode (UIPageViewController, see shouldUsePageViewController) needs a
+// longer, *enforced* settle on top of that: real device crash (2026-10-01,
+// swiping again right after reaching the last page) — "Assertion failure in
+// UIPageViewController.m... No view controller managing visible view" ->
+// NSInternalInconsistencyException -> abort(). _pageTransitionState alone
+// only protects OUR OWN programmatic navigateToPageForPagingMode: calls from
+// racing UIKit (see its own guard above); it was never able to stop the user
+// from starting a second real finger-driven page-turn before
+// UIPageViewController's own internal _UIQueuingScrollView has finished
+// cleaning up the first transition, which one run-loop turn isn't always
+// enough time for — especially right at a document boundary (no next/
+// previous view controller), which is UIPageViewController's own known
+// trigger for this exact assertion. Disabling _pdfView's user interaction
+// for the duration physically blocks a new page-turn pan gesture from ever
+// starting during that window (our own tap/doubletap recognizers are on
+// `self`, not `_pdfView` — see bindTap — so they're unaffected), closing the
+// race by construction instead of trying to out-guess UIKit's timing.
 - (void)beginSettlingAfterUserGestureEnd {
     _pageTransitionState = RNPDFPageTransitionSettling;
     NSInteger generation = ++_pageTransitionGeneration;
+    BOOL usingPageViewController = _enablePaging && !_horizontal;
+    if (usingPageViewController) {
+        _pdfView.userInteractionEnabled = NO;
+    }
     __weak __typeof(self) weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
+    void (^settle)(void) = ^{
         __typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
         if (strongSelf->_pageTransitionGeneration != generation) {
             // A new drag started while we were waiting out this run-loop turn -
-            // that gesture owns the state now, leave it alone.
+            // that gesture owns the state now, leave it alone. Only reachable in
+            // the non-paging case now, since the paging case physically blocks a
+            // new drag below for the whole wait.
             return;
         }
         strongSelf->_pageTransitionState = RNPDFPageTransitionIdle;
-        RCTLogInfo(@"👆 [iOS Scroll] page transition settled -> Idle");
-    });
+        strongSelf->_pdfView.userInteractionEnabled = YES;
+        RCTLogInfo(@"👆 [iOS Scroll] page transition settled -> Idle (usingPageViewController=%d)", usingPageViewController);
+    };
+    if (usingPageViewController) {
+        // 350ms: comfortably past UIPageViewController's own ~0.3s swipe/bounce-back
+        // transition animation, so its internal cleanup (not just ours) has actually
+        // finished before a new page-turn gesture can start.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), settle);
+    } else {
+        dispatch_async(dispatch_get_main_queue(), settle);
+    }
 }
 
 - (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
@@ -2060,6 +2180,24 @@ using namespace facebook::react;
     if (!decelerate) {
         RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDragging (no decelerate) - Settling");
         [self beginSettlingAfterUserGestureEnd];
+        return;
+    }
+    // decelerate==YES is the common case for a page-turn (or the boundary
+    // bounce-back when there's no next/previous page) — finger has lifted, but
+    // UIKit's own transition/settle animation is about to play and
+    // scrollViewDidEndDecelerating: won't fire until it's *done*. Leaving
+    // userInteractionEnabled untouched until then was the actual gap behind the
+    // 2026-10-01 crash dupe (see beginSettlingAfterUserGestureEnd's comment): a
+    // second finger-driven swipe starting mid-animation is exactly what races
+    // UIPageViewController's internal cleanup and asserts. Disable interaction
+    // for the animation itself, not just the post-animation tail — this doesn't
+    // interrupt the already-running animation (userInteractionEnabled only gates
+    // new touch hit-testing, never in-flight animations); scrollViewDidEndDecelerating:
+    // below re-asserts it (harmless) and owns scheduling the actual re-enable.
+    BOOL usingPageViewController = _enablePaging && !_horizontal;
+    if (usingPageViewController) {
+        _pdfView.userInteractionEnabled = NO;
+        RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDragging (will decelerate, paging) - blocking interaction through settle animation");
     }
 }
 
