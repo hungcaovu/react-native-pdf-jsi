@@ -413,6 +413,16 @@ typedef NS_ENUM(NSInteger, RNPDFPageTransitionState) {
     // Track usePageViewController state to prevent unnecessary reconfiguration
     BOOL _currentUsePageViewController;
     BOOL _usePageViewControllerStateInitialized;
+    // Set while reconfigureUsePageViewControllerIfNeededWithRetriesLeft: is tearing down/
+    // rebuilding PDFKit's internal page/content view (the "single page view" Quick Settings
+    // toggle). PDFKit resets _pdfView.currentPage to page 1 and posts
+    // PDFViewPageChangedNotification as a side effect of usePageViewController: — the same
+    // transient-reset behavior already guarded for the document-load path via
+    // `_previousPage == -1` below, except this trigger (a mode toggle mid-document) doesn't
+    // set that sentinel. Without this flag the spurious "page 1" notification reached
+    // onPageChanged: unguarded and got written straight into _page/_previousPage, which
+    // then round-tripped to JS as a real page-1 navigation on every single toggle.
+    BOOL _isReconfiguringPageViewController;
     
     // Search and highlight (iOS parity with Android)
     NSString *_pdfId;
@@ -841,6 +851,13 @@ using namespace facebook::react;
     RCTLogInfo(@"🔄 [iOS Scroll] Configuring usePageViewController - enablePaging=%d, horizontal=%d, usePageVC=%d",
               _enablePaging, _horizontal, shouldUsePageViewController);
 
+    // usePageViewController: is about to tear down/rebuild PDFKit's internal page/content
+    // view, which resets _pdfView.currentPage to page 1 as a side effect and posts
+    // PDFViewPageChangedNotification - see _isReconfiguringPageViewController's declaration.
+    // Capture the real page now so it can be restored once the rebuild settles below.
+    int pageBeforeReconfigure = _page;
+    _isReconfiguringPageViewController = YES;
+
     // Configure usePageViewController. Wrapped because PDFKit's internal
     // UIPageViewController teardown can still throw here even past the
     // _pageTransitionState guard above - see the comment on this method.
@@ -855,6 +872,7 @@ using namespace facebook::react;
             RCTLogInfo(@"✅ [iOS Scroll] Disabled UIPageViewController (using regular scrolling)");
         }
     } @catch (NSException *exception) {
+        _isReconfiguringPageViewController = NO;
         RCTLogError(@"⚠️ [iOS Scroll] usePageViewController: threw %@ (%@) - PDFKit's internal "
                     @"manual-scroll teardown raced this reconfigure. Leaving mode unchanged and "
                     @"retrying.", exception.name, exception.reason);
@@ -890,6 +908,28 @@ using namespace facebook::react;
             // _internalScrollView) has settled, instead of leaving the wrong zoom level
             // sticky until the document is reopened.
             [self recomputeFitScale];
+
+            // The onPageChanged: guard above suppressed PDFKit's transient "reset to page
+            // 1" notification so _page/JS were never corrupted, but the native view itself
+            // genuinely is sitting on page 1 now - steer it back to the real page.
+            PDFPage *restorePage = (pageBeforeReconfigure >= 1 && pageBeforeReconfigure <= (int)self->_pdfDocument.pageCount)
+                ? [self->_pdfDocument pageAtIndex:pageBeforeReconfigure - 1]
+                : nil;
+            if (restorePage) {
+                if (self->_currentUsePageViewController) {
+                    [self navigateToPageForPagingMode:restorePage targetPage:pageBeforeReconfigure retriesLeft:10];
+                } else {
+                    CGRect pdfPageRect = [restorePage boundsForBox:kPDFDisplayBoxCropBox];
+                    if (restorePage.rotation == 90 || restorePage.rotation == 270) {
+                        pdfPageRect = CGRectMake(0, 0, pdfPageRect.size.height, pdfPageRect.size.width);
+                    }
+                    CGPoint pointLeftTop = CGPointMake(0, pdfPageRect.size.height);
+                    PDFDestination *pdfDest = [[PDFDestination alloc] initWithPage:restorePage atPoint:pointLeftTop];
+                    [self->_pdfView goToDestination:pdfDest];
+                    self->_pdfView.scaleFactor = self->_fixScaleFactor * self->_scale;
+                }
+            }
+            self->_isReconfiguringPageViewController = NO;
         });
     });
 }
@@ -1741,6 +1781,16 @@ using namespace facebook::react;
         // that one spurious pre-navigation notification, never a genuine page 1 open.
         if (_previousPage == -1 && _page != 1 && newPage == 1) {
             RCTLogInfo(@"⏭️ [iOS PageChanged] Ignoring transient PDFKit default-to-page-1 notification before initial navigation to page %d", _page);
+            return;
+        }
+
+        // Same transient PDFKit reset as above, but triggered by toggling the single-page-
+        // view switch mid-document instead of an initial load — see
+        // _isReconfiguringPageViewController's declaration for why `_previousPage == -1`
+        // alone doesn't catch this case. reconfigureUsePageViewControllerIfNeededWithRetriesLeft:
+        // restores the real page itself once the rebuild settles, so just drop this one here.
+        if (_isReconfiguringPageViewController && _page != 1 && newPage == 1) {
+            RCTLogInfo(@"⏭️ [iOS PageChanged] Ignoring transient PDFKit default-to-page-1 notification during usePageViewController reconfigure (real page %d)", _page);
             return;
         }
 
