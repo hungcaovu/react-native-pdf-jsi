@@ -405,6 +405,10 @@ typedef NS_ENUM(NSInteger, RNPDFPageTransitionState) {
     // beat late, not a deliberate "tap to play" — only a tap seen while Idle
     // should be treated as intentional.
     RNPDFPageTransitionState _pageTransitionState;
+    // Set while a paging-mode settle is waiting on the real teardown-complete
+    // signal instead of a fixed timer - see beginSettlingAfterUserGestureEnd
+    // and onPageTransitionTeardownComplete:.
+    void (^_pagingSettleBlock)(void);
     // Bumped every time a new drag begins; a deferred Settling->Idle flip
     // captures this and only applies if it still matches, so a fresh gesture
     // that starts during the deferred window correctly cancels the old flip.
@@ -642,6 +646,7 @@ using namespace facebook::react;
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewDocumentChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewPageChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewScaleChangedNotification" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"RNPDFPageTransitionTeardownDidCompleteNotification" object:nil];
 
     // remove old recognizers before adding new ones
     [self removeGestureRecognizer:_doubleTapRecognizer];
@@ -775,6 +780,12 @@ using namespace facebook::react;
     [center addObserver:self selector:@selector(onDocumentChanged:) name:PDFViewDocumentChangedNotification object:_pdfView];
     [center addObserver:self selector:@selector(onPageChanged:) name:PDFViewPageChangedNotification object:_pdfView];
     [center addObserver:self selector:@selector(onScaleChanged:) name:PDFViewScaleChangedNotification object:_pdfView];
+    // No `object:` - posted by the UIPageViewController swizzle
+    // (UIPageViewController+RNPDFCrashGuard.mm), which has no reference to this
+    // specific RNPDFPdfView. onPageTransitionTeardownComplete: below no-ops unless
+    // this view's own paging settle is actually pending, so the broadcast scope is
+    // harmless.
+    [center addObserver:self selector:@selector(onPageTransitionTeardownComplete:) name:@"RNPDFPageTransitionTeardownDidCompleteNotification" object:nil];
 
     [[_pdfView document] setDelegate: self];
     [_pdfView setDelegate: self];
@@ -1514,6 +1525,7 @@ using namespace facebook::react;
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewDocumentChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewPageChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewScaleChangedNotification" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"RNPDFPageTransitionTeardownDidCompleteNotification" object:nil];
 
     _doubleTapRecognizer = nil;
     _singleTapRecognizer = nil;
@@ -2313,23 +2325,32 @@ using namespace facebook::react;
 // the scrollViewDidEndDragging:/scrollViewDidEndDecelerating: we're called
 // from) has fully returned before anything treats the view as Idle again.
 //
-// Paged mode (UIPageViewController, see shouldUsePageViewController) needs a
-// longer, *enforced* settle on top of that: real device crash (2026-10-01,
-// swiping again right after reaching the last page) — "Assertion failure in
-// UIPageViewController.m... No view controller managing visible view" ->
-// NSInternalInconsistencyException -> abort(). _pageTransitionState alone
-// only protects OUR OWN programmatic navigateToPageForPagingMode: calls from
-// racing UIKit (see its own guard above); it was never able to stop the user
-// from starting a second real finger-driven page-turn before
-// UIPageViewController's own internal _UIQueuingScrollView has finished
-// cleaning up the first transition, which one run-loop turn isn't always
-// enough time for — especially right at a document boundary (no next/
-// previous view controller), which is UIPageViewController's own known
-// trigger for this exact assertion. Disabling _pdfView's user interaction
-// for the duration physically blocks a new page-turn pan gesture from ever
-// starting during that window (our own tap/doubletap recognizers are on
-// `self`, not `_pdfView` — see bindTap — so they're unaffected), closing the
-// race by construction instead of trying to out-guess UIKit's timing.
+// Paged mode (UIPageViewController, see shouldUsePageViewController) needs
+// more than that: real device crash (2026-10-01, swiping again right after
+// reaching the last page) — "Assertion failure in UIPageViewController.m...
+// No view controller managing visible view" -> NSInternalInconsistencyException
+// -> abort(). _pageTransitionState alone only protects OUR OWN programmatic
+// navigateToPageForPagingMode: calls from racing UIKit (see its own guard
+// above); it was never able to stop the user from starting a second real
+// finger-driven page-turn before UIPageViewController's own internal
+// _UIQueuingScrollView has finished cleaning up the first transition —
+// especially right at a document boundary (no next/previous view
+// controller), which is UIPageViewController's own known trigger for this
+// exact assertion. Disabling _pdfView's user interaction for the duration
+// physically blocks a new page-turn pan gesture from ever starting during
+// that window (our own tap/doubletap recognizers are on `self`, not
+// `_pdfView` — see bindTap — so they're unaffected), closing the race by
+// construction instead of trying to out-guess UIKit's timing.
+//
+// What "the duration" is: this used to be a fixed 350ms guess (comfortably
+// past UIPageViewController's own ~0.3s transition animation). It's now
+// driven by the real signal instead — onPageTransitionTeardownComplete:,
+// fired off the exact UIKit method whose teardown this race is against (see
+// UIPageViewController+RNPDFCrashGuard.mm, which swizzles that same private
+// method to also swallow the assertion directly). A guessed duration was the
+// only option before that swizzle existed; now that we're already hooked
+// into the real completion callback, releasing off it is both more correct
+// and, in practice, faster than the old blind wait.
 - (void)beginSettlingAfterUserGestureEnd {
     _pageTransitionState = RNPDFPageTransitionSettling;
     NSInteger generation = ++_pageTransitionGeneration;
@@ -2342,10 +2363,8 @@ using namespace facebook::react;
         __typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
         if (strongSelf->_pageTransitionGeneration != generation) {
-            // A new drag started while we were waiting out this run-loop turn -
-            // that gesture owns the state now, leave it alone. Only reachable in
-            // the non-paging case now, since the paging case physically blocks a
-            // new drag below for the whole wait.
+            // A new drag started while we were waiting - that gesture owns the
+            // state now, leave it alone.
             return;
         }
         strongSelf->_pageTransitionState = RNPDFPageTransitionIdle;
@@ -2353,13 +2372,47 @@ using namespace facebook::react;
         RCTLogInfo(@"👆 [iOS Scroll] page transition settled -> Idle (usingPageViewController=%d)", usingPageViewController);
     };
     if (usingPageViewController) {
-        // 350ms: comfortably past UIPageViewController's own ~0.3s swipe/bounce-back
-        // transition animation, so its internal cleanup (not just ours) has actually
-        // finished before a new page-turn gesture can start.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), settle);
+        _pagingSettleBlock = settle;
+        // Safety net, not the primary path: queuingScrollView:didEndManualScroll:...
+        // is believed to fire for every manual scroll end, but that's reverse-
+        // engineered behavior (see UIPageViewController+RNPDFCrashGuard.mm), not a
+        // documented guarantee - e.g. a drag too small/slow to trigger a real page-
+        // turn transition may never reach it. Without this, a missed notification
+        // would leave _pdfView.userInteractionEnabled = NO permanently (worse than
+        // the 350ms wait it replaced). 1.5s is well past any legitimate transition,
+        // so this firing at all means the real signal was missed, not just slow.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || strongSelf->_pagingSettleBlock != settle) {
+                return;
+            }
+            RCTLogWarn(@"⚠️ [iOS Scroll] Teardown-complete notification never arrived after 1.5s - "
+                       @"releasing paging settle via fallback timeout instead.");
+            strongSelf->_pagingSettleBlock = nil;
+            settle();
+        });
     } else {
         dispatch_async(dispatch_get_main_queue(), settle);
     }
+}
+
+// Fired by RNPDFPageTransitionTeardownDidCompleteNotification (posted from
+// UIPageViewController+RNPDFCrashGuard.mm's swizzle, on every manual-scroll
+// teardown of ANY UIPageViewController in the process — see that file's
+// comment on why this is posted with no `object`). No-ops unless this view's
+// own paging settle is actually pending, so a notification from an unrelated
+// UIPageViewController elsewhere in the app is harmless.
+- (void)onPageTransitionTeardownComplete:(NSNotification *)notification {
+    if (!_pagingSettleBlock) {
+        return;
+    }
+    void (^settle)(void) = _pagingSettleBlock;
+    _pagingSettleBlock = nil;
+    // Same one-extra-run-loop-turn margin as the non-paging path above -
+    // we're called synchronously from inside the swizzle's @try block, i.e.
+    // still on UIKit's own teardown call stack, so defer the actual flip
+    // until it's fully unwound.
+    dispatch_async(dispatch_get_main_queue(), settle);
 }
 
 - (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {

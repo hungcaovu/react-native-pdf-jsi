@@ -24,6 +24,21 @@
  * version changes this method's name or signature, +load below simply finds
  * nothing to swizzle and logs that once - it fails safe (crash guard absent,
  * not a bad swizzle) rather than mismatching the calling convention.
+ *
+ * This method also doubles as the real "page-turn teardown is actually done"
+ * signal: it's UIKit's own callback for a manual (finger-driven) scroll
+ * ending, called synchronously once the internal transition cleanup this
+ * file guards against has run. RNPDFPdfView used to re-enable interaction
+ * after a *fixed* delay (guessed long enough to outlast UIKit's cleanup)
+ * because it had no earlier hook into this exact moment; now that this
+ * method is swizzled anyway, rnpdf_queuingScrollView:... below posts
+ * RNPDFPageTransitionTeardownDidCompleteNotification after every call so
+ * RNPDFPdfView can release its own lock off the real event instead of a
+ * guess. Posted with no `object`, so it's effectively global across any
+ * UIPageViewController in the process - harmless for RNPDFPdfView's listener
+ * since it already no-ops unless its own paging view is mid-settle, but
+ * worth knowing if another UIPageViewController-based UI (e.g. onboarding)
+ * is ever added to this app.
  */
 
 #import <Foundation/Foundation.h>
@@ -84,6 +99,9 @@
         RCTLogError(@"⚠️ [RNPDFCrashGuard] Swallowed UIPageViewController internal teardown exception "
                     @"(page-boundary swipe race): %@ - %@", exception.name, exception.reason);
     }
+    // Teardown attempt is over either way (clean or swallowed-exception) - tell
+    // RNPDFPdfView it can release its settle lock. See the class comment above.
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"RNPDFPageTransitionTeardownDidCompleteNotification" object:nil];
 }
 
 @end
