@@ -805,6 +805,16 @@ using namespace facebook::react;
 // settling aborted the app. Re-reads enablePaging/horizontal fresh at fire
 // time (not a captured value) so a prop flip-flop during the wait doesn't
 // apply a stale decision.
+//
+// The _pageTransitionState check above is only a proxy for our own read of
+// the gesture - it can go Idle a run-loop turn before _UIQueuingScrollView
+// finishes its own internal manual-scroll teardown, so usePageViewController:
+// can still race UIKit's private completion handler and throw even with the
+// guard in place (same device, still 2026-10-01, still reachable from the
+// single-page-view toggle). @try/@catch around the call is the actual
+// backstop: it's a regular NSException via objc_exception_throw, not a
+// memory-access crash, so it's safe to swallow - leave the mode unchanged
+// and retry rather than let it abort the process.
 - (void)reconfigureUsePageViewControllerIfNeededWithRetriesLeft:(int)retriesLeft {
     if (_pageTransitionState != RNPDFPageTransitionIdle) {
         if (retriesLeft <= 0) {
@@ -831,20 +841,35 @@ using namespace facebook::react;
     RCTLogInfo(@"🔄 [iOS Scroll] Configuring usePageViewController - enablePaging=%d, horizontal=%d, usePageVC=%d",
               _enablePaging, _horizontal, shouldUsePageViewController);
 
-    // Set state immediately
+    // Configure usePageViewController. Wrapped because PDFKit's internal
+    // UIPageViewController teardown can still throw here even past the
+    // _pageTransitionState guard above - see the comment on this method.
+    @try {
+        if (shouldUsePageViewController) {
+            // Only use page view controller for vertical orientation
+            [_pdfView usePageViewController:YES withViewOptions:@{UIPageViewControllerOptionSpineLocationKey:@(UIPageViewControllerSpineLocationMin),UIPageViewControllerOptionInterPageSpacingKey:@(_spacing)}];
+            RCTLogInfo(@"✅ [iOS Scroll] Enabled UIPageViewController (vertical paging mode)");
+        } else {
+            // For horizontal or when paging is disabled, use regular scrolling
+            [_pdfView usePageViewController:NO withViewOptions:Nil];
+            RCTLogInfo(@"✅ [iOS Scroll] Disabled UIPageViewController (using regular scrolling)");
+        }
+    } @catch (NSException *exception) {
+        RCTLogError(@"⚠️ [iOS Scroll] usePageViewController: threw %@ (%@) - PDFKit's internal "
+                    @"manual-scroll teardown raced this reconfigure. Leaving mode unchanged and "
+                    @"retrying.", exception.name, exception.reason);
+        if (retriesLeft > 0) {
+            __weak __typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [weakSelf reconfigureUsePageViewControllerIfNeededWithRetriesLeft:retriesLeft - 1];
+            });
+        }
+        return;
+    }
+
+    // Only commit the new state once usePageViewController: actually succeeded.
     _currentUsePageViewController = shouldUsePageViewController;
     _usePageViewControllerStateInitialized = YES;
-
-    // Configure usePageViewController
-    if (shouldUsePageViewController) {
-        // Only use page view controller for vertical orientation
-        [_pdfView usePageViewController:YES withViewOptions:@{UIPageViewControllerOptionSpineLocationKey:@(UIPageViewControllerSpineLocationMin),UIPageViewControllerOptionInterPageSpacingKey:@(_spacing)}];
-        RCTLogInfo(@"✅ [iOS Scroll] Enabled UIPageViewController (vertical paging mode)");
-    } else {
-        // For horizontal or when paging is disabled, use regular scrolling
-        [_pdfView usePageViewController:NO withViewOptions:Nil];
-        RCTLogInfo(@"✅ [iOS Scroll] Disabled UIPageViewController (using regular scrolling)");
-    }
 
     // Reconfigure scroll view after usePageViewController changes
     // PDFView's internal scroll view hierarchy changes when usePageViewController is toggled
@@ -859,6 +884,12 @@ using namespace facebook::react;
         dispatch_async(dispatch_get_main_queue(), ^{
             RCTLogInfo(@"🔧 [iOS Scroll] Reconfiguring scroll view after usePageViewController change (scrollEnabled=%d)", self->_scrollEnabled);
             [self configureScrollView:self->_pdfView enabled:self->_scrollEnabled depth:0];
+            // usePageViewController: rebuilt PDFKit's page/content view, and its own
+            // autoScales can leave scaleFactor at whatever it picked for the new layout.
+            // Reassert the fit baseline now that the new view hierarchy (and
+            // _internalScrollView) has settled, instead of leaving the wrong zoom level
+            // sticky until the document is reopened.
+            [self recomputeFitScale];
         });
     });
 }
@@ -869,6 +900,57 @@ using namespace facebook::react;
 // goToDestination:/goToRect:onPage: concurrently with UIKit's own transition.
 // Logs the exact inputs at each decision point so a future crash report can
 // be correlated with what this call was about to do.
+// Recomputes _fixScaleFactor (the "points-per-PDF-point" multiplier behind the JS-facing
+// scale/minScale/maxScale props) from the current frame and page geometry, and reapplies
+// it to PDFKit's scaleFactor/min/maxScaleFactor plus the internal scroll view's zoom
+// scales. Originally only ran on fitPolicy/minScale/maxScale/path changes (see
+// didSetProps below), but toggling enablePaging/horizontal also needs it: that rebuilds
+// PDFKit's internal page/content view via usePageViewController: (see
+// reconfigureUsePageViewControllerIfNeededWithRetriesLeft:), and PDFKit's own
+// autoScales=YES can leave scaleFactor at whatever it picked for the new layout instead
+// of honoring our "fit" baseline - which previously stuck around as a wrong zoom level
+// until the document was reopened, since nothing else re-derived it after a mode switch.
+- (void)recomputeFitScale {
+    if (!_pdfDocument) {
+        return;
+    }
+    PDFPage *pdfPage = _pdfView.currentPage ? _pdfView.currentPage : [_pdfDocument pageAtIndex:_pdfDocument.pageCount-1];
+    CGRect pdfPageRect = [pdfPage boundsForBox:kPDFDisplayBoxCropBox];
+
+    // some pdf with rotation, then adjust it
+    if (pdfPage.rotation == 90 || pdfPage.rotation == 270) {
+        pdfPageRect = CGRectMake(0, 0, pdfPageRect.size.height, pdfPageRect.size.width);
+    }
+
+    if (_fitPolicy == 0) {
+        _fixScaleFactor = self.frame.size.width/pdfPageRect.size.width;
+    } else if (_fitPolicy == 1) {
+        _fixScaleFactor = self.frame.size.height/pdfPageRect.size.height;
+    } else {
+        float pageAspect = pdfPageRect.size.width/pdfPageRect.size.height;
+        float reactViewAspect = self.frame.size.width/self.frame.size.height;
+        if (reactViewAspect>pageAspect) {
+            _fixScaleFactor = self.frame.size.height/pdfPageRect.size.height;
+        } else {
+            _fixScaleFactor = self.frame.size.width/pdfPageRect.size.width;
+        }
+    }
+
+    _pdfView.scaleFactor = _scale * _fixScaleFactor;
+    _pdfView.minScaleFactor = _fixScaleFactor*_minScale;
+    _pdfView.maxScaleFactor = _fixScaleFactor*_maxScale;
+
+    if (_internalScrollView && _fixScaleFactor > 0) {
+        _internalScrollView.minimumZoomScale = _fixScaleFactor * _minScale;
+        _internalScrollView.maximumZoomScale = _fixScaleFactor * _maxScale;
+        _internalScrollView.zoomScale = _pdfView.scaleFactor;
+        RCTLogInfo(@"🔍 [iOS Zoom] Configured internal scroll view zoom scales - min=%f, max=%f, current=%f",
+                  _internalScrollView.minimumZoomScale,
+                  _internalScrollView.maximumZoomScale,
+                  _internalScrollView.zoomScale);
+    }
+}
+
 - (void)navigateToPageForPagingMode:(PDFPage *)pdfPage targetPage:(int)targetPage retriesLeft:(int)retriesLeft {
     if (_pageTransitionState != RNPDFPageTransitionIdle) {
         if (retriesLeft <= 0) {
@@ -1122,53 +1204,7 @@ using namespace facebook::react;
         }
 
         if (_pdfDocument && ([effectiveChangedProps containsObject:@"path"] || [changedProps containsObject:@"fitPolicy"] || [changedProps containsObject:@"minScale"] || [changedProps containsObject:@"maxScale"])) {
-
-            PDFPage *pdfPage = _pdfView.currentPage ? _pdfView.currentPage : [_pdfDocument pageAtIndex:_pdfDocument.pageCount-1];
-            CGRect pdfPageRect = [pdfPage boundsForBox:kPDFDisplayBoxCropBox];
-
-            // some pdf with rotation, then adjust it
-            if (pdfPage.rotation == 90 || pdfPage.rotation == 270) {
-                pdfPageRect = CGRectMake(0, 0, pdfPageRect.size.height, pdfPageRect.size.width);
-            }
-
-            if (_fitPolicy == 0) {
-                _fixScaleFactor = self.frame.size.width/pdfPageRect.size.width;
-                _pdfView.scaleFactor = _scale * _fixScaleFactor;
-                _pdfView.minScaleFactor = _fixScaleFactor*_minScale;
-                _pdfView.maxScaleFactor = _fixScaleFactor*_maxScale;
-            } else if (_fitPolicy == 1) {
-                _fixScaleFactor = self.frame.size.height/pdfPageRect.size.height;
-                _pdfView.scaleFactor = _scale * _fixScaleFactor;
-                _pdfView.minScaleFactor = _fixScaleFactor*_minScale;
-                _pdfView.maxScaleFactor = _fixScaleFactor*_maxScale;
-            } else {
-                float pageAspect = pdfPageRect.size.width/pdfPageRect.size.height;
-                float reactViewAspect = self.frame.size.width/self.frame.size.height;
-                if (reactViewAspect>pageAspect) {
-                    _fixScaleFactor = self.frame.size.height/pdfPageRect.size.height;
-                    _pdfView.scaleFactor = _scale * _fixScaleFactor;
-                    _pdfView.minScaleFactor = _fixScaleFactor*_minScale;
-                    _pdfView.maxScaleFactor = _fixScaleFactor*_maxScale;
-                } else {
-                    _fixScaleFactor = self.frame.size.width/pdfPageRect.size.width;
-                    _pdfView.scaleFactor = _scale * _fixScaleFactor;
-                    _pdfView.minScaleFactor = _fixScaleFactor*_minScale;
-                    _pdfView.maxScaleFactor = _fixScaleFactor*_maxScale;
-                }
-            }
-            
-            // CRITICAL: Also configure the internal scroll view zoom scales
-            // This must be done AFTER _fixScaleFactor is set above
-            if (_internalScrollView && _fixScaleFactor > 0) {
-                _internalScrollView.minimumZoomScale = _fixScaleFactor * _minScale;
-                _internalScrollView.maximumZoomScale = _fixScaleFactor * _maxScale;
-                _internalScrollView.zoomScale = _pdfView.scaleFactor;
-                RCTLogInfo(@"🔍 [iOS Zoom] Configured internal scroll view zoom scales - min=%f, max=%f, current=%f", 
-                          _internalScrollView.minimumZoomScale, 
-                          _internalScrollView.maximumZoomScale, 
-                          _internalScrollView.zoomScale);
-            }
-
+            [self recomputeFitScale];
         }
 
         // Skip while a live pinch is in progress: `scale` here is JS echoing back
