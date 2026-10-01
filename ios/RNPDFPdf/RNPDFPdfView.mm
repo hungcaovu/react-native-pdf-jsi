@@ -771,6 +771,77 @@ using namespace facebook::react;
     _page = pageValue;
 }
 
+// usePageViewController:withViewOptions: tears down/rebuilds PDFKit's internal
+// UIPageViewController synchronously. Calling it while the user's own
+// finger-driven page-turn transition is still in flight (_pageTransitionState
+// != Idle) races UIPageViewController's own _UIQueuingScrollView cleanup and
+// hits the same "No view controller managing visible view" assertion as
+// navigateToPageForPagingMode: above - except this entry point is reached
+// from didSetProps: (e.g. the reader's "Single page view" Quick Settings
+// toggle, which is a Fabric prop update and bypasses touch hit-testing
+// entirely, so _pdfView.userInteractionEnabled doesn't block it). Real device
+// crash, 2026-10-01: toggling the switch while a manual swipe was still
+// settling aborted the app. Re-reads enablePaging/horizontal fresh at fire
+// time (not a captured value) so a prop flip-flop during the wait doesn't
+// apply a stale decision.
+- (void)reconfigureUsePageViewControllerIfNeededWithRetriesLeft:(int)retriesLeft {
+    if (_pageTransitionState != RNPDFPageTransitionIdle) {
+        if (retriesLeft <= 0) {
+            RCTLogWarn(@"⚠️ [iOS Scroll] Giving up on usePageViewController reconfigure - user is still "
+                       @"mid page-transition after retry budget exhausted. Leaving current mode in place.");
+            return;
+        }
+        __weak __typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf reconfigureUsePageViewControllerIfNeededWithRetriesLeft:retriesLeft - 1];
+        });
+        return;
+    }
+
+    BOOL shouldUsePageViewController = _enablePaging && !_horizontal;
+    if (_usePageViewControllerStateInitialized && shouldUsePageViewController == _currentUsePageViewController) {
+        // Desired state already matches - either another call already applied
+        // it, or props flipped back before we got a clear run-loop turn.
+        return;
+    }
+
+    // Fix: Disable usePageViewController when horizontal is true, as it conflicts with horizontal scrolling
+    // UIPageViewController doesn't work well with horizontal PDFView display direction
+    RCTLogInfo(@"🔄 [iOS Scroll] Configuring usePageViewController - enablePaging=%d, horizontal=%d, usePageVC=%d",
+              _enablePaging, _horizontal, shouldUsePageViewController);
+
+    // Set state immediately
+    _currentUsePageViewController = shouldUsePageViewController;
+    _usePageViewControllerStateInitialized = YES;
+
+    // Configure usePageViewController
+    if (shouldUsePageViewController) {
+        // Only use page view controller for vertical orientation
+        [_pdfView usePageViewController:YES withViewOptions:@{UIPageViewControllerOptionSpineLocationKey:@(UIPageViewControllerSpineLocationMin),UIPageViewControllerOptionInterPageSpacingKey:@(_spacing)}];
+        RCTLogInfo(@"✅ [iOS Scroll] Enabled UIPageViewController (vertical paging mode)");
+    } else {
+        // For horizontal or when paging is disabled, use regular scrolling
+        [_pdfView usePageViewController:NO withViewOptions:Nil];
+        RCTLogInfo(@"✅ [iOS Scroll] Disabled UIPageViewController (using regular scrolling)");
+    }
+
+    // Reconfigure scroll view after usePageViewController changes
+    // PDFView's internal scroll view hierarchy changes when usePageViewController is toggled
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // Reset scroll view references to allow reconfiguration
+        RCTLogInfo(@"🔄 [iOS Scroll] Resetting scroll view references for reconfiguration");
+        self->_internalScrollView = nil;
+        self->_originalScrollDelegate = nil;
+        self->_scrollDelegateProxy = nil;
+
+        // Reconfigure scroll view after view hierarchy updates
+        dispatch_async(dispatch_get_main_queue(), ^{
+            RCTLogInfo(@"🔧 [iOS Scroll] Reconfiguring scroll view after usePageViewController change (scrollEnabled=%d)", self->_scrollEnabled);
+            [self configureScrollView:self->_pdfView enabled:self->_scrollEnabled depth:0];
+        });
+    });
+}
+
 // Jumps _pdfView to targetPage while usePageViewController paging mode is on.
 // Waits out any in-flight user-driven scroll/decelerate (and its Settling
 // tail — see _pageTransitionState comment) instead of calling
@@ -1115,41 +1186,7 @@ using namespace facebook::react;
             ([effectiveChangedProps containsObject:@"path"] ||
              ((!_usePageViewControllerStateInitialized || shouldUsePageViewController != _currentUsePageViewController) &&
               ([changedProps containsObject:@"enablePaging"] || [changedProps containsObject:@"horizontal"])))) {
-            // Fix: Disable usePageViewController when horizontal is true, as it conflicts with horizontal scrolling
-            // UIPageViewController doesn't work well with horizontal PDFView display direction
-            RCTLogInfo(@"🔄 [iOS Scroll] Configuring usePageViewController - enablePaging=%d, horizontal=%d, usePageVC=%d",
-                      _enablePaging, _horizontal, shouldUsePageViewController);
-
-            // Set state immediately
-            _currentUsePageViewController = shouldUsePageViewController;
-            _usePageViewControllerStateInitialized = YES;
-
-            // Configure usePageViewController
-            if (shouldUsePageViewController) {
-                // Only use page view controller for vertical orientation
-                [_pdfView usePageViewController:YES withViewOptions:@{UIPageViewControllerOptionSpineLocationKey:@(UIPageViewControllerSpineLocationMin),UIPageViewControllerOptionInterPageSpacingKey:@(_spacing)}];
-                RCTLogInfo(@"✅ [iOS Scroll] Enabled UIPageViewController (vertical paging mode)");
-            } else {
-                // For horizontal or when paging is disabled, use regular scrolling
-                [_pdfView usePageViewController:NO withViewOptions:Nil];
-                RCTLogInfo(@"✅ [iOS Scroll] Disabled UIPageViewController (using regular scrolling)");
-            }
-            
-            // Reconfigure scroll view after usePageViewController changes
-            // PDFView's internal scroll view hierarchy changes when usePageViewController is toggled
-            dispatch_async(dispatch_get_main_queue(), ^{
-                // Reset scroll view references to allow reconfiguration
-                RCTLogInfo(@"🔄 [iOS Scroll] Resetting scroll view references for reconfiguration");
-                self->_internalScrollView = nil;
-                self->_originalScrollDelegate = nil;
-                self->_scrollDelegateProxy = nil;
-                
-                // Reconfigure scroll view after view hierarchy updates
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    RCTLogInfo(@"🔧 [iOS Scroll] Reconfiguring scroll view after usePageViewController change (scrollEnabled=%d)", self->_scrollEnabled);
-                    [self configureScrollView:self->_pdfView enabled:self->_scrollEnabled depth:0];
-                });
-            });
+            [self reconfigureUsePageViewControllerIfNeededWithRetriesLeft:10];
         }
 
         if (_pdfDocument && ([effectiveChangedProps containsObject:@"path"] || [changedProps containsObject:@"singlePage"])) {
