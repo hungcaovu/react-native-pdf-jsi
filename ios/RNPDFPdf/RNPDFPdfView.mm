@@ -12,6 +12,7 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <PDFKit/PDFKit.h>
+#import <objc/runtime.h>
 
 #if __has_include(<React/RCTAssert.h>)
 #import <React/RCTBridgeModule.h>
@@ -51,6 +52,17 @@
 
 // output log both debug and release
 #define RLog( s, ... ) NSLog( @"<%p %@:(%d)> %@", self, [[NSString stringWithUTF8String:__FILE__] lastPathComponent], __LINE__, [NSString stringWithFormat:(s), ##__VA_ARGS__] )
+
+// Page-number pipeline trace (native -> JS -> page indicator). Every hop logs with this
+// tag - native here, JS in index.js and ReaderPdfScreen.tsx - so one log filtered on
+// "PGDBG" shows the whole chain in order. Each native line is also forwarded to JS (see
+// RNPDFPgdbgLog below), so it shows up in Metro next to the JS side's lines.
+// Debug builds only: in release the macro compiles to nothing, arguments included.
+#ifndef __OPTIMIZE__
+#define PGDBG( s, ... ) RNPDFPgdbgLog( [NSString stringWithFormat:@"🧷 [PGDBG][native] " s, ##__VA_ARGS__] )
+#else
+#define PGDBG( s, ... ) do {} while (0)
+#endif
 
 const float MAX_SCALE = 3.0f;
 const float MIN_SCALE = 1.0f;
@@ -177,8 +189,27 @@ const float MIN_SCALE = 1.0f;
 }
 @end
 
+/**
+ *  Sits between one of PDFKit's internal scroll views and that scroll view's original
+ *  delegate (PDFKit's own controller), fanning callbacks out to both it and RNPDFPdfView.
+ *
+ *  Lifetime: UIScrollView.delegate is weak, so each proxy is retained by the scroll view
+ *  it is installed on (objc associated object, see -hookScrollViewDelegateIfNeeded:).
+ *  This used to be a single `_scrollDelegateProxy` ivar shared by every scroll view
+ *  configureScrollView: found - in paged mode there are several (UIPageViewController's
+ *  page-turn scroller plus one zoom scroller per page), so each new proxy released the
+ *  previous one, the previous scroll view's delegate silently became nil, and the next
+ *  configure pass installed RNPDFPdfView as its bare delegate with no forwarding. Device
+ *  logs (2026-10-01) showed exactly that: PDFDocumentViewController and
+ *  PDFPageViewController were cut off from their own scroll views, so the page-turn
+ *  bookkeeping and per-page zoom state drifted out of sync with what was on screen.
+ */
 @interface RNPDFScrollViewDelegateProxy : NSObject <UIScrollViewDelegate>
 - (instancetype)initWithPrimary:(id<UIScrollViewDelegate>)primary secondary:(id<UIScrollViewDelegate>)secondary;
+- (id<UIScrollViewDelegate>)primaryDelegate;
+- (id<UIScrollViewDelegate>)secondaryDelegate;
+/// YES for UIPageViewController's own page-turn scroller (paged mode) - see -isPageTurnScrollView:.
+@property (nonatomic, assign) BOOL isPageTurnScrollView;
 @end
 
 @implementation RNPDFScrollViewDelegateProxy {
@@ -192,6 +223,14 @@ const float MIN_SCALE = 1.0f;
         _secondary = secondary;
     }
     return self;
+}
+
+- (id<UIScrollViewDelegate>)primaryDelegate {
+    return _primary;
+}
+
+- (id<UIScrollViewDelegate>)secondaryDelegate {
+    return _secondary;
 }
 
 - (BOOL)respondsToSelector:(SEL)aSelector {
@@ -208,6 +247,38 @@ const float MIN_SCALE = 1.0f;
         return _secondary;
     }
     return [super forwardingTargetForSelector:aSelector];
+}
+
+// UIScrollView decides which optional callbacks to send when its delegate is set (it caches
+// respondsToSelector:). _primary is weak, and this proxy now lives as long as its scroll
+// view, so if PDFKit's controller is freed first, a callback only it implemented would
+// reach forwardingTargetForSelector: with no target and raise unrecognized-selector.
+// Swallow those instead - limited to scroll-view delegate callbacks, anything else still
+// fails normally.
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
+    NSMethodSignature *signature = [super methodSignatureForSelector:aSelector];
+    if (signature) {
+        return signature;
+    }
+    struct objc_method_description description =
+        protocol_getMethodDescription(@protocol(UIScrollViewDelegate), aSelector, NO, YES);
+    if (description.types) {
+        return [NSMethodSignature signatureWithObjCTypes:description.types];
+    }
+    if ([NSStringFromSelector(aSelector) hasPrefix:@"queuingScrollView"]) {
+        // _UIQueuingScrollView's private callbacks to its UIPageViewController.
+        return [NSMethodSignature signatureWithObjCTypes:"v@:"];
+    }
+    return nil;
+}
+
+- (void)forwardInvocation:(NSInvocation *)invocation {
+    NSUInteger returnLength = invocation.methodSignature.methodReturnLength;
+    if (returnLength > 0) {
+        void *zeroed = calloc(1, returnLength);
+        [invocation setReturnValue:zeroed];
+        free(zeroed);
+    }
 }
 
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
@@ -286,34 +357,22 @@ const float MIN_SCALE = 1.0f;
     }
 }
 
+// PDFKit's own controller is the authority on what its scroll view zooms (PDFDocumentView
+// in continuous mode, PDFTextInputView per page in paged mode - confirmed in device logs).
+// A nil answer from it is respected, not overridden by guessing a subview: that guess is
+// what used to make UIPageViewController's page-turn scroller "zoomable" with a scroll
+// indicator as its zoom view. Only a scroll view whose original delegate has no opinion
+// at all falls through to RNPDFPdfView, which also returns nil for the page-turn scroller.
 - (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
-    // First check if primary delegate (PDFView's internal) handles it
-    if (_primary && [_primary respondsToSelector:@selector(viewForZoomingInScrollView:)]) {
-        UIView *zoomView = [_primary viewForZoomingInScrollView:scrollView];
-        if (zoomView != nil) {
-            NSLog(@"🔍 [iOS Zoom Delegate] Primary delegate returned zoom view: %@", NSStringFromClass([zoomView class]));
-            return zoomView;
-        }
+    id<UIScrollViewDelegate> primary = _primary;
+    if (primary && [primary respondsToSelector:@selector(viewForZoomingInScrollView:)]) {
+        return [primary viewForZoomingInScrollView:scrollView];
     }
-
-    // PDFKit's scroll view needs to zoom the PDFDocumentView
-    // Search for it in the hierarchy
-    for (UIView *subview in scrollView.subviews) {
-        NSString *className = NSStringFromClass([subview class]);
-        if ([className containsString:@"PDFDocumentView"] || [className containsString:@"PDFPage"]) {
-            NSLog(@"🔍 [iOS Zoom Delegate] Found PDF view for zooming: %@", className);
-            return subview;
-        }
+    id<UIScrollViewDelegate> secondary = _secondary;
+    if (secondary && [secondary respondsToSelector:@selector(viewForZoomingInScrollView:)]) {
+        return [secondary viewForZoomingInScrollView:scrollView];
     }
-
-    // Fallback to first subview if it exists
-    UIView *fallback = scrollView.subviews.firstObject;
-    if (fallback) {
-        NSLog(@"🔍 [iOS Zoom Delegate] Using fallback zoom view: %@", NSStringFromClass([fallback class]));
-    } else {
-        NSLog(@"⚠️ [iOS Zoom Delegate] WARNING: No view found for zooming! Scroll view has %lu subviews", (unsigned long)scrollView.subviews.count);
-    }
-    return fallback;
+    return nil;
 }
 
 @end
@@ -323,7 +382,23 @@ const float MIN_SCALE = 1.0f;
 , RCTRNPDFPdfViewViewProtocol
 #endif
 >
+#ifndef __OPTIMIZE__
+- (void)pgdbgForwardToJS:(NSString *)line;
+#endif
 @end
+
+#ifndef __OPTIMIZE__
+// Most recently created PDF view - the one the PGDBG trace is forwarded through.
+static __weak RNPDFPdfView *sPgdbgForwardView = nil;
+
+static void RNPDFPgdbgLog(NSString *line) {
+    RCTLogInfo(@"%@", line);
+    RNPDFPdfView *view = sPgdbgForwardView;
+    if (view) {
+        [view pgdbgForwardToJS:line];
+    }
+}
+#endif
 
 // Gesture/transition state for the paging (UIPageViewController) mode's
 // finger-driven scroll vs. UIKit's own internal transition cleanup — see the
@@ -334,14 +409,25 @@ typedef NS_ENUM(NSInteger, RNPDFPageTransitionState) {
     RNPDFPageTransitionSettling,
 };
 
+// Associated-object keys on PDFKit's scroll views (see RNPDFScrollViewDelegateProxy).
+static const void *kRNPDFScrollDelegateProxyKey = &kRNPDFScrollDelegateProxyKey;
+static const void *kRNPDFPagingCarryTokenKey = &kRNPDFPagingCarryTokenKey;
+
 @implementation RNPDFPdfView
 {
     RCTBridge *_bridge;
     PDFDocument *_pdfDocument;
     PDFView *_pdfView;
-    UIScrollView *_internalScrollView;
-    id<UIScrollViewDelegate> _originalScrollDelegate;
-    RNPDFScrollViewDelegateProxy *_scrollDelegateProxy;
+    // Continuous mode: PDFKit's single scroll view (scrolls between pages AND zooms).
+    // Paged mode: not used for zoom - each page has its own zoom scroller there, see
+    // -activeZoomScrollView / -visiblePageZoomScrollView. Weak: in paged mode it may be a
+    // page scroller UIPageViewController has since dropped, which must not be kept alive.
+    __weak UIScrollView *_internalScrollView;
+    // Scale values reported to JS (scaleChanged) that JS hasn't echoed back as the `scale`
+    // prop yet, oldest first - see the scale handling in updateProps:.
+    NSMutableArray<NSNumber *> *_pendingScaleEchoes;
+    // The scale JS currently believes in: the last one we reported, or one JS set itself.
+    float _jsKnownScale;
     PDFOutline *root;
     float _fixScaleFactor;
     // Set true for the duration of a live two-finger pinch (scrollViewWillBeginZooming/
@@ -413,6 +499,33 @@ typedef NS_ENUM(NSInteger, RNPDFPageTransitionState) {
     // captures this and only applies if it still matches, so a fresh gesture
     // that starts during the deferred window correctly cancels the old flip.
     NSInteger _pageTransitionGeneration;
+
+    // Paged mode zoom carry-over. PDFKit zooms each page in its own scroll view, so a
+    // finger-driven page turn always revealed the next page at PDFKit's default fit
+    // zoom (the programmatic path, navigateToPageForPagingMode:, never runs for a
+    // swipe). Captured from the page being left when a page-turn drag begins, applied
+    // to the incoming page as soon as it scrolls into view, re-checked at settle.
+    BOOL _pagingCarryValid;
+    CGFloat _pagingCarryRatio;      // JS-facing scale (zoomScale / _fixScaleFactor) of the page being left
+    CGFloat _pagingCarryFracX;      // horizontal viewport position (0..1) on the page being left
+    int _pagingCarryFromPage;
+    __weak UIScrollView *_pagingCarryFromScrollView;
+    NSInteger _pagingCarryToken;    // bumped per capture; marks which incoming scroll views already got it
+    // The page caught sliding in mid-turn, and from which side - reused at settle rather
+    // than re-deriving direction from views UIPageViewController may have detached by then.
+    __weak UIScrollView *_pagingCarryIncomingScrollView;
+    BOOL _pagingCarryIncomingFromBelow;
+    // _pageTransitionGeneration of the page-turn drag whose finger has lifted. A teardown
+    // notification only counts as "this gesture's" once its finger is up.
+    NSInteger _pageTurnFingerLiftedGeneration;
+    // _pageTransitionGeneration at which the page-turn teardown notification arrived while
+    // no settle was pending yet - i.e. before scrollViewDidEnd{Dragging,Decelerating}:
+    // reached us for that same gesture. See beginSettlingAfterUserGestureEnd.
+    NSInteger _pagingTeardownSeenGeneration;
+    BOOL _scrollViewHookPassScheduled;
+    // Sequence number stamped on every event sent to JS (PGDBG trace), so a missing
+    // delivery shows up as a gap on the JS side.
+    NSInteger _pgdbgEventSeq;
     
     // Track usePageViewController state to prevent unnecessary reconfiguration
     BOOL _currentUsePageViewController;
@@ -503,19 +616,40 @@ using namespace facebook::react;
         [updatedPropNames addObject:@"path"];
     }
     if (_page != newProps.page) {
+        PGDBG(@"<- JS page prop %d (native _page=%d _previousPage=%d state=%ld) - will %@",
+              (int)newProps.page, _page, _previousPage, (long)_pageTransitionState,
+              ((int)newProps.page != _previousPage) ? @"NAVIGATE (differs from last reported page)" : @"not navigate (matches last reported page)");
         _page = newProps.page;
         [updatedPropNames addObject:@"page"];
     }
-    if (_scale != newProps.scale) {
-        // This fires on ANY prop update once JS's `scale` prop stops matching what the
-        // user's pinch/native side is currently tracking here (e.g. JS never overrides
-        // the fork's default `scale=1`) — even when this updateProps call was only about
-        // `page` or `highlightRects` changing. That mismatch is exactly what snaps the
-        // view's real zoom back to `_scale` below, so log it whenever it's about to happen.
-        RCTLogInfo(@"🔍 [iOS Zoom] scale prop diff: native _scale=%f -> incoming newProps.scale=%f (changedProps so far=%@)",
-                   _scale, newProps.scale, updatedPropNames);
-        _scale = newProps.scale;
-        [updatedPropNames addObject:@"scale"];
+    // JS echoes every scale native reports back down as the `scale` prop (that is what keeps
+    // an unrelated re-render from snapping the zoom to a stale default). Two things used to
+    // make those echoes re-apply zoom:
+    //  - exact comparison: the prop is CGFloat (double) on iOS but _scale is float, so even
+    //    an identical echo compared unequal - every prop update while zoomed (e.g. each
+    //    sentence-highlight change) re-applied the zoom and ran a full layoutDocumentView;
+    //  - lag: echoes of values reported mid-pinch land after the pinch has moved on (or
+    //    ended), and re-applying them stepped the zoom back through old values - the
+    //    highlight overlay jumping along with it.
+    // So: compare with a tolerance, and treat an incoming value matching one we reported
+    // and JS hasn't echoed yet as an echo, not a request. Anything else (JS resetting to 1
+    // on a mode toggle or new document) is a real request.
+    double incomingScale = newProps.scale;
+    NSUInteger echoIndex = [self indexOfPendingScaleEcho:incomingScale];
+    if (fabs((double)_scale - incomingScale) > 0.001) {
+        if (echoIndex != NSNotFound) {
+            [_pendingScaleEchoes removeObjectsInRange:NSMakeRange(0, echoIndex + 1)];
+            PGDBG(@"zoom: Ignoring stale scale echo %f (native is at %f)", incomingScale, _scale);
+        } else {
+            PGDBG(@"zoom: scale prop changed by JS: native _scale=%f -> %f (changedProps so far=%@)",
+                       _scale, incomingScale, updatedPropNames);
+            [_pendingScaleEchoes removeAllObjects];
+            _scale = incomingScale;
+            _jsKnownScale = _scale;
+            [updatedPropNames addObject:@"scale"];
+        }
+    } else if (echoIndex != NSNotFound) {
+        [_pendingScaleEchoes removeObjectsInRange:NSMakeRange(0, echoIndex + 1)];
     }
     if (_minScale != newProps.minScale) {
         _minScale = newProps.minScale;
@@ -646,6 +780,7 @@ using namespace facebook::react;
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewDocumentChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewPageChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewScaleChangedNotification" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:PDFViewVisiblePagesChangedNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"RNPDFPageTransitionTeardownDidCompleteNotification" object:nil];
 
     // remove old recognizers before adding new ones
@@ -733,7 +868,16 @@ using namespace facebook::react;
     // Initialize usePageViewController state tracking
     _currentUsePageViewController = NO;
     _usePageViewControllerStateInitialized = NO;
-    
+#ifndef __OPTIMIZE__
+    sPgdbgForwardView = self;
+#endif
+    _pagingCarryValid = NO;
+    _pagingTeardownSeenGeneration = -1;
+    _pageTurnFingerLiftedGeneration = -1;
+    _scrollViewHookPassScheduled = NO;
+    _pendingScaleEchoes = [NSMutableArray array];
+    _jsKnownScale = _scale;
+
     // Enhanced properties
     _enableCaching = YES;
     _enablePreloading = YES;
@@ -780,6 +924,11 @@ using namespace facebook::react;
     [center addObserver:self selector:@selector(onDocumentChanged:) name:PDFViewDocumentChangedNotification object:_pdfView];
     [center addObserver:self selector:@selector(onPageChanged:) name:PDFViewPageChangedNotification object:_pdfView];
     [center addObserver:self selector:@selector(onScaleChanged:) name:PDFViewScaleChangedNotification object:_pdfView];
+#ifndef __OPTIMIZE__
+    // Trace only (PGDBG): PDFKit's own "what is on screen now" signal, independent of
+    // PDFViewPageChangedNotification/currentPage which drive the page number.
+    [center addObserver:self selector:@selector(onVisiblePagesChanged:) name:PDFViewVisiblePagesChangedNotification object:_pdfView];
+#endif
     // No `object:` - posted by the UIPageViewController swizzle
     // (UIPageViewController+RNPDFCrashGuard.mm), which has no reference to this
     // specific RNPDFPdfView. onPageTransitionTeardownComplete: below no-ops unless
@@ -903,11 +1052,13 @@ using namespace facebook::react;
     // Reconfigure scroll view after usePageViewController changes
     // PDFView's internal scroll view hierarchy changes when usePageViewController is toggled
     dispatch_async(dispatch_get_main_queue(), ^{
-        // Reset scroll view references to allow reconfiguration
-        RCTLogInfo(@"🔄 [iOS Scroll] Resetting scroll view references for reconfiguration");
+        // Only drop our pointer to the old scroll view. Proxies are owned by the scroll
+        // views they sit on, so PDFKit's old scrollers take theirs with them and the new
+        // ones get hooked below. (This used to also nil the shared proxy ivar, which
+        // released whichever proxy was installed and left that scroll view delegate-less.)
+        RCTLogInfo(@"🔄 [iOS Scroll] Resetting scroll view reference for reconfiguration");
         self->_internalScrollView = nil;
-        self->_originalScrollDelegate = nil;
-        self->_scrollDelegateProxy = nil;
+        self->_pagingCarryValid = NO;
 
         // Reconfigure scroll view after view hierarchy updates
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -991,14 +1142,18 @@ using namespace facebook::react;
     _pdfView.minScaleFactor = _fixScaleFactor*_minScale;
     _pdfView.maxScaleFactor = _fixScaleFactor*_maxScale;
 
-    if (_internalScrollView && _fixScaleFactor > 0) {
-        _internalScrollView.minimumZoomScale = _fixScaleFactor * _minScale;
-        _internalScrollView.maximumZoomScale = _fixScaleFactor * _maxScale;
-        _internalScrollView.zoomScale = _pdfView.scaleFactor;
-        RCTLogInfo(@"🔍 [iOS Zoom] Configured internal scroll view zoom scales - min=%f, max=%f, current=%f",
-                  _internalScrollView.minimumZoomScale,
-                  _internalScrollView.maximumZoomScale,
-                  _internalScrollView.zoomScale);
+    // Continuous: PDFKit's one scroll view. Paged: the visible page's own zoom scroller
+    // (never UIPageViewController's page-turn scroller, which must not zoom at all).
+    UIScrollView *zoomScrollView = [self activeZoomScrollView];
+    if (zoomScrollView && _fixScaleFactor > 0) {
+        [self applyZoomLimitsToScrollView:zoomScrollView];
+        CGFloat target = MIN(MAX(_scale * _fixScaleFactor, zoomScrollView.minimumZoomScale), zoomScrollView.maximumZoomScale);
+        zoomScrollView.zoomScale = target;
+        RCTLogInfo(@"🔍 [iOS Zoom] Configured zoom scroll view - min=%f, max=%f, current=%f (paged=%d)",
+                  zoomScrollView.minimumZoomScale,
+                  zoomScrollView.maximumZoomScale,
+                  zoomScrollView.zoomScale,
+                  _currentUsePageViewController);
     }
 }
 
@@ -1022,6 +1177,7 @@ using namespace facebook::react;
         return;
     }
 
+    PGDBG(@"programmatic navigate START to page %d %@", targetPage, [self pgdbgSnapshot]);
     RCTLogInfo(@"➡️ [iOS Scroll] Performing programmatic navigate to page %d (pageCount=%lu, currentPage=%d)",
                targetPage, (unsigned long)_pdfDocument.pageCount, _page);
 
@@ -1267,14 +1423,24 @@ using namespace facebook::react;
         // as the PDF juddering while the user holds a pinch. The live gesture is already
         // the source of truth during this window; nothing needs to be applied until it ends.
         if (_pdfDocument && !_isLiveZooming && ([effectiveChangedProps containsObject:@"path"] || [changedProps containsObject:@"scale"])) {
-            _pdfView.scaleFactor = _scale * _fixScaleFactor;
-            if (_pdfView.scaleFactor>_pdfView.maxScaleFactor) _pdfView.scaleFactor = _pdfView.maxScaleFactor;
-            if (_pdfView.scaleFactor<_pdfView.minScaleFactor) _pdfView.scaleFactor = _pdfView.minScaleFactor;
+            if (_currentUsePageViewController) {
+                // Paged mode: zoom lives in the visible page's own scroll view, and
+                // _scale is kept in sync from that same scroll view (scrollViewDidZoom:),
+                // so this is normally a no-op echo. Skipped mid page-turn: which page
+                // is "visible" is ambiguous then, and settle re-syncs it anyway.
+                if (_pageTransitionState == RNPDFPageTransitionIdle) {
+                    [self applyScaleToVisiblePageScrollView];
+                }
+            } else {
+                _pdfView.scaleFactor = _scale * _fixScaleFactor;
+                if (_pdfView.scaleFactor>_pdfView.maxScaleFactor) _pdfView.scaleFactor = _pdfView.maxScaleFactor;
+                if (_pdfView.scaleFactor<_pdfView.minScaleFactor) _pdfView.scaleFactor = _pdfView.minScaleFactor;
 
-            // Also update internal scroll view zoom scale when scale changes
-            if (_internalScrollView && _fixScaleFactor > 0) {
-                _internalScrollView.zoomScale = _pdfView.scaleFactor;
-                RCTLogInfo(@"🔍 [iOS Zoom] Updated internal scroll view zoom scale to %f", _internalScrollView.zoomScale);
+                // Also update internal scroll view zoom scale when scale changes
+                if (_internalScrollView && _fixScaleFactor > 0) {
+                    _internalScrollView.zoomScale = _pdfView.scaleFactor;
+                    RCTLogInfo(@"🔍 [iOS Zoom] Updated internal scroll view zoom scale to %f", _internalScrollView.zoomScale);
+                }
             }
         }
 
@@ -1329,17 +1495,13 @@ using namespace facebook::react;
                       [effectiveChangedProps containsObject:@"path"], 
                       [changedProps containsObject:@"scrollEnabled"]);
             
-            // If path changed, restore original delegate before reconfiguring
-            if ([effectiveChangedProps containsObject:@"path"] && _internalScrollView) {
-                RCTLogInfo(@"🔄 [iOS Scroll] Restoring original scroll delegate (path changed)");
-                if (_originalScrollDelegate) {
-                    _internalScrollView.delegate = _originalScrollDelegate;
-                } else {
-                    _internalScrollView.delegate = nil;
-                }
+            // If path changed, hand every scroll view back to PDFKit's own delegate before
+            // reconfiguring - configureScrollView: below re-hooks whatever is there now.
+            if ([effectiveChangedProps containsObject:@"path"]) {
+                RCTLogInfo(@"🔄 [iOS Scroll] Restoring original scroll delegates (path changed)");
+                [self unhookScrollViewDelegatesInView:_pdfView depth:0];
                 _internalScrollView = nil;
-                _originalScrollDelegate = nil;
-                _scrollDelegateProxy = nil;
+                _pagingCarryValid = NO;
             }
             
             // Use dispatch_async to ensure view hierarchy is fully set up after document load
@@ -1367,7 +1529,7 @@ using namespace facebook::react;
         // still true for the first (which would leave _previousPage stale and unable to
         // recover) versus the currentPage genuinely oscillating inside PDFKit itself.
         if ([changedProps containsObject:@"page"]) {
-            RCTLogInfo(@"🔁 [iOS PageProp] page=%d previousPage=%d isNavigating=%d pageTransitionState=%ld documentLoaded=%d pageCount=%lu enablePaging=%d -> shouldNavigate=%d",
+            PGDBG(@"didSetProps page=%d previousPage=%d isNavigating=%d pageTransitionState=%ld documentLoaded=%d pageCount=%lu enablePaging=%d -> shouldNavigate=%d",
                        _page, _previousPage, _isNavigating, (long)_pageTransitionState, _documentLoaded,
                        _pdfDocument ? (unsigned long)_pdfDocument.pageCount : 0, _enablePaging, shouldNavigateToPage);
         }
@@ -1498,15 +1660,77 @@ using namespace facebook::react;
 
 - (void)notifyOnChangeWithMessage:(NSString *)message
 {
+#ifndef __OPTIMIZE__
+    // PGDBG trace (debug builds only): number every event sent to JS. Page events also
+    // carry the number as a trailing field (JS reads fields 1-2 by index and ignores
+    // extras), so the JS side can log which native event it is handling.
+    NSInteger seq = ++_pgdbgEventSeq;
+    if ([message hasPrefix:@"pageChanged|"] || [message hasPrefix:@"displayPageChanged|"]) {
+        message = [NSString stringWithFormat:@"%@|%ld", message, (long)seq];
+    }
+    // loadComplete carries the whole table of contents - keep the trace line short.
+    NSString *traceMessage = message.length > 160 ? [[message substringToIndex:160] stringByAppendingString:@"…"] : message;
+#endif
 #ifdef RCT_NEW_ARCH_ENABLED
     if (_eventEmitter != nullptr) {
              std::dynamic_pointer_cast<const RNPDFPdfViewEventEmitter>(_eventEmitter)
                  ->onChange(RNPDFPdfViewEventEmitter::OnChange{.message = RCTStringFromNSString(message)});
-           }
+        PGDBG(@"-> JS event #%ld: %@", (long)seq, traceMessage);
+    } else {
+        PGDBG(@"-> JS event #%ld DROPPED - no event emitter: %@", (long)seq, traceMessage);
+    }
 #else
     _onChange(@{ @"message": message});
+    PGDBG(@"-> JS event #%ld (paper): %@", (long)seq, traceMessage);
 #endif
 }
+
+#ifndef __OPTIMIZE__
+// Sends a PGDBG trace line to JS as a "pgdbg|<line>" onChange message. Deliberately not
+// through notifyOnChangeWithMessage: (which itself traces every event it sends) and with no
+// sequence number, so forwarding can't recurse or shift the real events' numbering.
+- (void)pgdbgForwardToJS:(NSString *)line {
+#ifdef RCT_NEW_ARCH_ENABLED
+    if (_eventEmitter == nullptr) return;
+    NSString *message = [@"pgdbg|" stringByAppendingString:[line stringByReplacingOccurrencesOfString:@"|" withString:@"¦"]];
+    std::dynamic_pointer_cast<const RNPDFPdfViewEventEmitter>(_eventEmitter)
+        ->onChange(RNPDFPdfViewEventEmitter::OnChange{.message = RCTStringFromNSString(message)});
+#endif
+}
+
+// One-line snapshot of every input the page number depends on, for PGDBG trace lines.
+// pdfkitCurrent drives the page number; visible/center are PDFKit's own view of what is
+// on screen, logged so a stale currentPage shows up as a disagreement between them.
+- (NSString *)pgdbgSnapshot {
+    int current = (_pdfDocument && _pdfView.currentPage) ? (int)[_pdfDocument indexForPage:_pdfView.currentPage] + 1 : -1;
+    NSMutableArray<NSString *> *visible = [NSMutableArray array];
+    int center = -1;
+    if (_pdfDocument && _pdfView) {
+        for (PDFPage *visiblePage in _pdfView.visiblePages) {
+            [visible addObject:[NSString stringWithFormat:@"%lu", (unsigned long)[_pdfDocument indexForPage:visiblePage] + 1]];
+        }
+        CGPoint mid = CGPointMake(CGRectGetMidX(_pdfView.bounds), CGRectGetMidY(_pdfView.bounds));
+        PDFPage *centerPage = [_pdfView pageForPoint:mid nearest:YES];
+        if (centerPage) {
+            center = (int)[_pdfDocument indexForPage:centerPage] + 1;
+        }
+    }
+    return [NSString stringWithFormat:@"pdfkitCurrent=%d visible=[%@] center=%d | _page=%d _previousPage=%d state=%ld gen=%ld navigating=%d paged=%d reconfiguring=%d",
+            current, [visible componentsJoinedByString:@","], center, _page, _previousPage,
+            (long)_pageTransitionState, (long)_pageTransitionGeneration, _isNavigating,
+            _currentUsePageViewController, _isReconfiguringPageViewController];
+}
+
+- (NSString *)pgdbgScrollViewKind:(UIScrollView *)scrollView {
+    if ([self isPageTurnScrollView:scrollView]) return @"pageTurn";
+    return _currentUsePageViewController ? @"pageZoom" : @"main";
+}
+
+// Trace only - see the observer registration in initCommonProps.
+- (void)onVisiblePagesChanged:(NSNotification *)noti {
+    PGDBG(@"PDFKit visiblePagesChanged: %@", [self pgdbgSnapshot]);
+}
+#endif // !__OPTIMIZE__ (PGDBG trace helpers)
 
 - (void)dealloc{
     [_preloadQueue cancelAllOperations];
@@ -1525,6 +1749,7 @@ using namespace facebook::react;
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewDocumentChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewPageChangedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PDFViewScaleChangedNotification" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:PDFViewVisiblePagesChangedNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"RNPDFPageTransitionTeardownDidCompleteNotification" object:nil];
 
     _doubleTapRecognizer = nil;
@@ -1605,7 +1830,7 @@ using namespace facebook::react;
         return _pdfView.documentView;
     }
 
-    UIScrollView *scrollView = _internalScrollView;
+    UIScrollView *scrollView = [self activeZoomScrollView];
     for (UIView *subview in scrollView.subviews) {
         NSString *className = NSStringFromClass([subview class]);
         if ([className containsString:@"PDFDocumentView"] || [className containsString:@"PDFPage"]) {
@@ -1647,6 +1872,9 @@ using namespace facebook::react;
 
     UIView *container = [self highlightContainerView];
     if (_highlightOverlay.superview != container) {
+        RCTLogInfo(@"🖍️ [iOS Highlight] overlay container %@ -> %@ (paged=%d)",
+                   _highlightOverlay.superview ? NSStringFromClass([_highlightOverlay.superview class]) : @"(none)",
+                   NSStringFromClass([container class]), _currentUsePageViewController);
         [_highlightOverlay removeFromSuperview];
         [container addSubview:_highlightOverlay];
     }
@@ -1771,6 +1999,9 @@ using namespace facebook::react;
 
 - (void)onPageChanged:(NSNotification *)noti
 {
+    PGDBG(@"onPageChanged ENTER (source=%@) %@",
+          noti ? @"PDFViewPageChangedNotification" : @"settle cross-check",
+          [self pgdbgSnapshot]);
 
     if (_pdfDocument) {
         PDFPage *currentPage = _pdfView.currentPage;
@@ -1792,7 +2023,7 @@ using namespace facebook::react;
         // and cleared by the first real page-changed report, so this only ever suppresses
         // that one spurious pre-navigation notification, never a genuine page 1 open.
         if (_previousPage == -1 && _page != 1 && newPage == 1) {
-            RCTLogInfo(@"⏭️ [iOS PageChanged] Ignoring transient PDFKit default-to-page-1 notification before initial navigation to page %d", _page);
+            PGDBG(@"onPageChanged DROPPED (guard: transient default-to-page-1 before initial navigation to page %d)", _page);
             return;
         }
 
@@ -1802,8 +2033,33 @@ using namespace facebook::react;
         // alone doesn't catch this case. reconfigureUsePageViewControllerIfNeededWithRetriesLeft:
         // restores the real page itself once the rebuild settles, so just drop this one here.
         if (_isReconfiguringPageViewController && _page != 1 && newPage == 1) {
-            RCTLogInfo(@"⏭️ [iOS PageChanged] Ignoring transient PDFKit default-to-page-1 notification during usePageViewController reconfigure (real page %d)", _page);
+            PGDBG(@"onPageChanged DROPPED (guard: transient default-to-page-1 during usePageViewController reconfigure, real page %d)", _page);
             return;
+        }
+
+        if (_currentUsePageViewController) {
+            // Paged mode: PDFKit commits a finger-driven page turn late - at the start of
+            // the NEXT touch - and the currentPage it commits can itself be stale. Device
+            // trace (2026-10-02): swiping back from the last page, currentPage stayed 14
+            // while pages 13 and 12 were shown, then this notification fired with 14 as the
+            // next swipe began and the indicator jumped to "14/14". Mid page-turn it is only
+            // ever such a late commit; the turn reports its own page when it comes to rest
+            // (reportOnScreenPageIfChanged:), so ignore it.
+            if (noti != nil && _pageTransitionState != RNPDFPageTransitionIdle) {
+                PGDBG(@"onPageChanged IGNORED mid page-turn (PDFKit late commit, currentPage=%d, on screen=%d) %@",
+                      newPage, [self onScreenPageNumber], [self pgdbgSnapshot]);
+                return;
+            }
+            // Otherwise prefer what is actually on screen if PDFKit's currentPage disagrees -
+            // except mid single-page-view toggle, where the screen is the one that's
+            // transiently wrong (page 1, see updateDisplayPageForScrollIfNeeded).
+            int onScreenPage = _isReconfiguringPageViewController ? -1 : [self onScreenPageNumber];
+            if (onScreenPage >= 1 && onScreenPage != newPage) {
+                PGDBG(@"onPageChanged: PDFKit currentPage=%d disagrees with page on screen=%d - using the on-screen page",
+                      newPage, onScreenPage);
+                newPage = onScreenPage;
+                page = (unsigned long)(onScreenPage - 1);
+            }
         }
 
         // CRITICAL FIX: Update _previousPage to the new page value when page changes from PDFView notifications
@@ -1836,20 +2092,38 @@ using namespace facebook::react;
         // genuinely oscillating" apart from "we kept re-triggering navigate ourselves".
         RCTLogInfo(@"🔁 [iOS PageChanged] currentPage=%d isNavigating=%d pageTransitionState=%ld",
                    _page, _isNavigating, (long)_pageTransitionState);
+        PGDBG(@"onPageChanged REPORT page %lu/%lu to JS", page + 1, numberOfPages);
         [self notifyOnChangeWithMessage:[[NSString alloc] initWithString:[NSString stringWithFormat:@"pageChanged|%lu|%lu", page+1, numberOfPages]]];
         if (_highlightOverlay) [_highlightOverlay setNeedsDisplay];
+        if (_currentUsePageViewController) {
+            // Hook the newly shown page's own zoom scroller (programmatic page changes
+            // never pass through the swipe settle path, which does this too) - otherwise
+            // pinching it never reaches scrollViewDidZoom: and the highlight overlay
+            // stops tracking the zoom.
+            [self scheduleScrollViewHookPass];
+        }
     }
 
 }
 
 - (void)onScaleChanged:(NSNotification *)noti
 {
+    // Paged mode: the visible page's own scroll view is the single source of truth for
+    // zoom (see scrollViewDidZoom:). PDFView.scaleFactor isn't tied to one particular
+    // page's scroller there, and reading it from more than one place is what produced
+    // device logs (2026-10-01) of one pinch reporting 1.127 and then 1.000 within the
+    // same millisecond - each round-tripping through JS's `scale` prop and snapping the
+    // zoom back and forth, with the highlight jumping along with it.
+    if (_currentUsePageViewController) {
+        if (_highlightOverlay) [_highlightOverlay setNeedsDisplay];
+        return;
+    }
     if (_initialed && _fixScaleFactor>0) {
         float newScale = _pdfView.scaleFactor/_fixScaleFactor;
         // Only notify if scale changed significantly (threshold of 0.01 to prevent excessive callbacks)
         if (fabs(_scale - newScale) > 0.01f) {
             _scale = newScale;
-            [self notifyOnChangeWithMessage:[[NSString alloc] initWithString:[NSString stringWithFormat:@"scaleChanged|%f", _scale]]];
+            [self reportScaleToJS];
         }
     }
     if (_highlightOverlay) [_highlightOverlay setNeedsDisplay];
@@ -2086,112 +2360,448 @@ using namespace facebook::react;
     }
 }
 
+// Walks PDFKit's view hierarchy and hooks every scroll view in it. Safe to call as often
+// as layout passes happen: already-hooked scroll views are left alone, and nothing here
+// touches a scroll view's current zoom except clamping it into range.
+//
+// Paged mode has two kinds of scroll view (device logs, 2026-10-01):
+//  - UIPageViewController's page-turn scroller (_UIQueuingScrollView, delegate
+//    PDFDocumentViewController) - scrolls between pages, must never zoom;
+//  - one zoom scroller per page (delegate PDFPageViewController, zoom view
+//    PDFTextInputView) - this is where pinch-zoom actually happens.
+// Continuous mode has one (PDFScrollView, its own delegate) that does both.
 - (void)configureScrollView:(UIView *)view enabled:(BOOL)enabled depth:(int)depth {
-    // Log entry to track all calls
     if (depth == 0) {
-        RCTLogInfo(@"🚀 [iOS Scroll] configureScrollView called - enabled=%d, view=%@", enabled, NSStringFromClass([view class]));
+        RCTLogInfo(@"🚀 [iOS Scroll] configureScrollView called - enabled=%d, view=%@, paged=%d",
+                   enabled, NSStringFromClass([view class]), _currentUsePageViewController);
     }
-    
+
     // max depth, prevent infinite loop
     if (depth > 10) {
         RCTLogWarn(@"⚠️ [iOS Scroll] Max depth reached in configureScrollView (depth=%d)", depth);
         return;
     }
-    
+
     if ([view isKindOfClass:[UIScrollView class]]) {
         UIScrollView *scrollView = (UIScrollView *)view;
-        RCTLogInfo(@"📱 [iOS Scroll] Found UIScrollView at depth=%d, frame=%@, contentSize=%@, enabled=%d", 
-                  depth, 
-                  NSStringFromCGRect(scrollView.frame),
-                  NSStringFromCGSize(scrollView.contentSize),
-                  enabled);
-        
-        // Since we're starting the recursion from _pdfView, all scroll views found are within its hierarchy
-        // Configure scroll properties
-        BOOL previousScrollEnabled = scrollView.scrollEnabled;
+        [self hookScrollViewDelegateIfNeeded:scrollView];
+
         scrollView.scrollEnabled = enabled;
-        
-        if (previousScrollEnabled != enabled) {
-            RCTLogInfo(@"🔄 [iOS Scroll] Changed scrollEnabled: %d -> %d", previousScrollEnabled, enabled);
-        }
-        
-        // Conditionally set horizontal bouncing based on scroll direction
-        // Allow horizontal bounce when horizontal scrolling is enabled
-        BOOL previousAlwaysBounceHorizontal = scrollView.alwaysBounceHorizontal;
-        if (_horizontal) {
-            scrollView.alwaysBounceHorizontal = YES;
-        } else {
-            // Disable horizontal bouncing for vertical scrolling to prevent interference with navigation swipe-back
-        scrollView.alwaysBounceHorizontal = NO;
-        }
-        
-        if (previousAlwaysBounceHorizontal != scrollView.alwaysBounceHorizontal) {
-            RCTLogInfo(@"🔄 [iOS Scroll] Changed alwaysBounceHorizontal: %d -> %d (horizontal=%d)", 
-                      previousAlwaysBounceHorizontal, 
-                      scrollView.alwaysBounceHorizontal,
-                      _horizontal);
-        }
-        
+        // Allow horizontal bounce only when scrolling horizontally - for vertical scrolling
+        // it would interfere with the navigation swipe-back gesture.
+        scrollView.alwaysBounceHorizontal = _horizontal;
         // Keep vertical bounce enabled for natural scrolling feel
         scrollView.bounces = YES;
-        
-        // Configure scroll view zoom scales to match PDFView's scale factors
-        // This enables native pinch-to-zoom gestures
-        if (_fixScaleFactor > 0) {
-            scrollView.minimumZoomScale = _fixScaleFactor * _minScale;
-            scrollView.maximumZoomScale = _fixScaleFactor * _maxScale;
-            scrollView.zoomScale = _pdfView.scaleFactor;
-            RCTLogInfo(@"🔍 [iOS Zoom] Configured zoom scales - min=%f, max=%f, current=%f", 
-                      scrollView.minimumZoomScale, 
-                      scrollView.maximumZoomScale, 
-                      scrollView.zoomScale);
-        }
-        
-        RCTLogInfo(@"📊 [iOS Scroll] ScrollView config - scrollEnabled=%d, alwaysBounceHorizontal=%d, bounces=%d, delegate=%@", 
-                  scrollView.scrollEnabled,
-                  scrollView.alwaysBounceHorizontal,
-                  scrollView.bounces,
-                  scrollView.delegate != nil ? @"set" : @"nil");
-        
-        // IMPORTANT: PDFKit relies on the scrollView delegate for pinch-zoom (viewForZoomingInScrollView).
-        // Install a proxy delegate that forwards to the original delegate, while still letting us observe scroll events.
-        // CRITICAL FIX: Always set up delegate for new scroll views (PDFView may recreate scroll view on document load)
-        if (!_internalScrollView || _internalScrollView != scrollView) {
-            RCTLogInfo(@"✅ [iOS Scroll] Setting up scroll view delegate (new=%d)", _internalScrollView == nil);
-            _internalScrollView = scrollView;
-            
-            // Get the current delegate (might be PDFView's internal delegate)
-            id<UIScrollViewDelegate> currentDelegate = scrollView.delegate;
-            
-            // Only capture original delegate if it's not us or our proxy
-            if (currentDelegate && currentDelegate != self && ![currentDelegate isKindOfClass:[RNPDFScrollViewDelegateProxy class]]) {
-                _originalScrollDelegate = currentDelegate;
-                RCTLogInfo(@"📝 [iOS Scroll] Captured original scroll delegate: %@", NSStringFromClass([currentDelegate class]));
-            }
-            
-            if (_originalScrollDelegate) {
-                _scrollDelegateProxy = [[RNPDFScrollViewDelegateProxy alloc] initWithPrimary:_originalScrollDelegate secondary:(id<UIScrollViewDelegate>)self];
-                scrollView.delegate = (id<UIScrollViewDelegate>)_scrollDelegateProxy;
-                RCTLogInfo(@"🔗 [iOS Scroll] Installed scroll delegate proxy");
-            } else {
-                scrollView.delegate = self;
-                RCTLogInfo(@"🔗 [iOS Scroll] Set self as scroll delegate (no original delegate)");
+
+        if ([self isPageTurnScrollView:scrollView]) {
+            // Every scroll view used to get zoom limits here, which made this one
+            // pinch-zoomable too (with a scroll indicator as its "zoom view"), competing
+            // with the page's real zoom scroller for the same pinch and distorting the
+            // page-turn layout itself.
+            if (scrollView.minimumZoomScale != 1 || scrollView.maximumZoomScale != 1) {
+                RCTLogWarn(@"⚠️ [iOS Zoom] Page-turn scroller had zoom range %f..%f - resetting to 1..1",
+                           scrollView.minimumZoomScale, scrollView.maximumZoomScale);
+                scrollView.minimumZoomScale = 1;
+                scrollView.maximumZoomScale = 1;
             }
         } else {
-            RCTLogInfo(@"⚠️ [iOS Scroll] Same scroll view, delegate already configured");
+            [self applyZoomLimitsToScrollView:scrollView];
+            _internalScrollView = scrollView;
         }
     }
-    
+
     for (UIView *subview in view.subviews) {
         [self configureScrollView:subview enabled:enabled depth:depth + 1];
     }
-    
+
     // Log at root level if no scroll view was found
     if (depth == 0 && !_internalScrollView) {
-        RCTLogWarn(@"⚠️ [iOS Scroll] No UIScrollView found in view hierarchy (view=%@, subviewCount=%lu)", 
-                  NSStringFromClass([view class]), 
+        RCTLogWarn(@"⚠️ [iOS Scroll] No zoomable UIScrollView found in view hierarchy (view=%@, subviewCount=%lu)",
+                  NSStringFromClass([view class]),
                   (unsigned long)[view.subviews count]);
     }
+}
+
+// Coalesces "hook whatever scroll views exist now" requests into one pass per run-loop
+// turn - UIPageViewController creates a new page's scroll view on every page change.
+- (void)scheduleScrollViewHookPass {
+    if (_scrollViewHookPassScheduled) return;
+    _scrollViewHookPassScheduled = YES;
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf->_scrollViewHookPassScheduled = NO;
+        if (strongSelf->_pdfDocument && strongSelf->_pdfView) {
+            [strongSelf configureScrollView:strongSelf->_pdfView enabled:strongSelf->_scrollEnabled depth:0];
+        }
+    });
+}
+
+#pragma mark - Scroll view delegate hooking
+
+- (BOOL)scrollView:(UIScrollView *)scrollView looksLikePageTurnScrollerWithDelegate:(id)originalDelegate {
+    if ([originalDelegate isKindOfClass:[UIPageViewController class]]) {
+        return YES;
+    }
+    return [NSStringFromClass([scrollView class]) containsString:@"QueuingScrollView"];
+}
+
+// UIPageViewController's own page-turn scroller (paged mode only).
+- (BOOL)isPageTurnScrollView:(UIScrollView *)scrollView {
+    RNPDFScrollViewDelegateProxy *proxy = objc_getAssociatedObject(scrollView, kRNPDFScrollDelegateProxyKey);
+    if (proxy) {
+        return proxy.isPageTurnScrollView;
+    }
+    id delegate = scrollView.delegate;
+    if ([delegate isKindOfClass:[RNPDFScrollViewDelegateProxy class]]) {
+        delegate = [(RNPDFScrollViewDelegateProxy *)delegate primaryDelegate];
+    }
+    return [self scrollView:scrollView looksLikePageTurnScrollerWithDelegate:delegate];
+}
+
+// Wraps the scroll view's current (PDFKit) delegate in a proxy owned by the scroll view
+// itself - see RNPDFScrollViewDelegateProxy for why ownership matters. Idempotent.
+- (void)hookScrollViewDelegateIfNeeded:(UIScrollView *)scrollView {
+    id currentDelegate = scrollView.delegate;
+    if ([currentDelegate isKindOfClass:[RNPDFScrollViewDelegateProxy class]]) {
+        RNPDFScrollViewDelegateProxy *existing = (RNPDFScrollViewDelegateProxy *)currentDelegate;
+        if ([existing secondaryDelegate] == (id)self) {
+            return;
+        }
+        // Left over from another (recycled) RNPDFPdfView - unwrap to PDFKit's own delegate.
+        currentDelegate = [existing primaryDelegate];
+    }
+    if (currentDelegate == (id)self) {
+        currentDelegate = nil;
+    }
+
+    RNPDFScrollViewDelegateProxy *proxy = [[RNPDFScrollViewDelegateProxy alloc] initWithPrimary:currentDelegate
+                                                                                     secondary:(id<UIScrollViewDelegate>)self];
+    proxy.isPageTurnScrollView = [self scrollView:scrollView looksLikePageTurnScrollerWithDelegate:currentDelegate];
+    objc_setAssociatedObject(scrollView, kRNPDFScrollDelegateProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    scrollView.delegate = proxy;
+    RCTLogInfo(@"🔗 [iOS Scroll] Hooked %@ (original delegate: %@, pageTurn=%d, frame=%@, contentSize=%@)",
+               NSStringFromClass([scrollView class]),
+               currentDelegate ? NSStringFromClass([currentDelegate class]) : @"(none)",
+               proxy.isPageTurnScrollView,
+               NSStringFromCGRect(scrollView.frame),
+               NSStringFromCGSize(scrollView.contentSize));
+}
+
+// Hands every scroll view we hooked back to PDFKit's own delegate.
+- (void)unhookScrollViewDelegatesInView:(UIView *)view depth:(int)depth {
+    if (!view || depth > 10) return;
+    if ([view isKindOfClass:[UIScrollView class]]) {
+        UIScrollView *scrollView = (UIScrollView *)view;
+        id currentDelegate = scrollView.delegate;
+        if ([currentDelegate isKindOfClass:[RNPDFScrollViewDelegateProxy class]] &&
+            [(RNPDFScrollViewDelegateProxy *)currentDelegate secondaryDelegate] == (id)self) {
+            // Restore first, then drop the proxy - it must not be released while it is
+            // still the scroll view's delegate.
+            scrollView.delegate = [(RNPDFScrollViewDelegateProxy *)currentDelegate primaryDelegate];
+            objc_setAssociatedObject(scrollView, kRNPDFScrollDelegateProxyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+    for (UIView *subview in view.subviews) {
+        [self unhookScrollViewDelegatesInView:subview depth:depth + 1];
+    }
+}
+
+#pragma mark - Zoom scroll views
+
+// min/max from the JS-facing minScale/maxScale. The current zoom is only clamped into
+// that range, never reset - this used to force zoomScale = _pdfView.scaleFactor on every
+// configure pass, i.e. on every layout change.
+- (void)applyZoomLimitsToScrollView:(UIScrollView *)scrollView {
+    if (_fixScaleFactor <= 0 || [self isPageTurnScrollView:scrollView]) return;
+    CGFloat minZoom = _fixScaleFactor * _minScale;
+    CGFloat maxZoom = _fixScaleFactor * _maxScale;
+    if (scrollView.minimumZoomScale != minZoom) scrollView.minimumZoomScale = minZoom;
+    if (scrollView.maximumZoomScale != maxZoom) scrollView.maximumZoomScale = maxZoom;
+    if (!_isLiveZooming) {
+        if (scrollView.zoomScale < minZoom - 0.0001) {
+            scrollView.zoomScale = minZoom;
+        } else if (scrollView.zoomScale > maxZoom + 0.0001) {
+            scrollView.zoomScale = maxZoom;
+        }
+    }
+}
+
+- (void)collectPageZoomScrollViewsInView:(UIView *)view depth:(int)depth into:(NSMutableArray<UIScrollView *> *)result {
+    if (!view || depth > 10) return;
+    if ([view isKindOfClass:[UIScrollView class]] && ![self isPageTurnScrollView:(UIScrollView *)view]) {
+        [result addObject:(UIScrollView *)view];
+    }
+    for (UIView *subview in view.subviews) {
+        [self collectPageZoomScrollViewsInView:subview depth:depth + 1 into:result];
+    }
+}
+
+// Fraction of the PDF view's area this scroll view currently covers on screen (0..1).
+- (CGFloat)visibleFractionOfScrollView:(UIScrollView *)scrollView {
+    if (!_pdfView || !scrollView.window || scrollView.hidden) return 0;
+    CGRect pdfBounds = _pdfView.bounds;
+    CGFloat pdfArea = pdfBounds.size.width * pdfBounds.size.height;
+    if (pdfArea <= 0) return 0;
+    CGRect frameInPdfView = [scrollView convertRect:scrollView.bounds toView:_pdfView];
+    CGRect visible = CGRectIntersection(frameInPdfView, pdfBounds);
+    if (CGRectIsNull(visible)) return 0;
+    return (visible.size.width * visible.size.height) / pdfArea;
+}
+
+// Paged mode: the zoom scroller of the page actually on screen. UIPageViewController keeps
+// neighbor pages loaded (each with its own zoom scroller) just off screen.
+- (UIScrollView *)visiblePageZoomScrollView {
+    NSMutableArray<UIScrollView *> *candidates = [NSMutableArray array];
+    [self collectPageZoomScrollViewsInView:_pdfView depth:0 into:candidates];
+    UIScrollView *best = nil;
+    CGFloat bestFraction = 0;
+    for (UIScrollView *candidate in candidates) {
+        CGFloat fraction = [self visibleFractionOfScrollView:candidate];
+        if (fraction > bestFraction) {
+            bestFraction = fraction;
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+- (UIScrollView *)activeZoomScrollView {
+    return _currentUsePageViewController ? [self visiblePageZoomScrollView] : _internalScrollView;
+}
+
+// Paged mode counterpart of the `scale` prop branch in didSetProps.
+- (void)applyScaleToVisiblePageScrollView {
+    if (_fixScaleFactor <= 0) return;
+    UIScrollView *scrollView = [self visiblePageZoomScrollView];
+    if (!scrollView) return;
+    [self applyZoomLimitsToScrollView:scrollView];
+    CGFloat target = MIN(MAX(_scale * _fixScaleFactor, scrollView.minimumZoomScale), scrollView.maximumZoomScale);
+    if (fabs(scrollView.zoomScale - target) > 0.001) {
+        PGDBG(@"zoom: Applying scale prop %f to visible page scroller (zoom %f -> %f)",
+                   _scale, scrollView.zoomScale, target);
+        scrollView.zoomScale = target;
+    }
+}
+
+// Paged mode: make _scale (and JS) match the page now on screen, reporting at most once.
+- (void)syncScaleFromVisiblePageScrollView {
+    if (_fixScaleFactor <= 0) return;
+    UIScrollView *scrollView = [self visiblePageZoomScrollView];
+    if (!scrollView) return;
+    float newScale = scrollView.zoomScale / _fixScaleFactor;
+    if (fabs(_scale - newScale) > 0.01f) {
+        PGDBG(@"zoom: Visible page scale %f differs from reported %f - reporting it", newScale, _scale);
+        _scale = newScale;
+        [self reportScaleToJS];
+    }
+}
+
+// Every scaleChanged report goes through here, so updateProps: can tell JS's echo of it
+// apart from a real scale request.
+- (void)reportScaleToJS {
+    [_pendingScaleEchoes addObject:@(_scale)];
+    if (_pendingScaleEchoes.count > 32) {
+        [_pendingScaleEchoes removeObjectAtIndex:0];
+    }
+    _jsKnownScale = _scale;
+    [self notifyOnChangeWithMessage:[NSString stringWithFormat:@"scaleChanged|%f", _scale]];
+}
+
+// Earliest not-yet-echoed report matching `scale`: JS echoes reports in order, possibly
+// skipping some React batched together, so everything before the match is stale too.
+- (NSUInteger)indexOfPendingScaleEcho:(double)scale {
+    for (NSUInteger i = 0; i < _pendingScaleEchoes.count; i++) {
+        if (fabs(_pendingScaleEchoes[i].doubleValue - scale) < 0.0005) {
+            return i;
+        }
+    }
+    return NSNotFound;
+}
+
+#pragma mark - Paged mode page-turn follow-up
+
+// Called when a finger-driven page turn begins on the page-turn scroller: remember the
+// zoom and horizontal position of the page being left.
+- (void)capturePagingZoomCarry {
+    UIScrollView *pageScrollView = [self visiblePageZoomScrollView];
+    if (!pageScrollView || _fixScaleFactor <= 0) {
+        _pagingCarryValid = NO;
+        return;
+    }
+    _pagingCarryValid = YES;
+    _pagingCarryToken++;
+    _pagingCarryFromScrollView = pageScrollView;
+    _pagingCarryIncomingScrollView = nil;
+    _pagingCarryFromPage = _pdfView.currentPage ? (int)[_pdfDocument indexForPage:_pdfView.currentPage] + 1 : _page;
+    _pagingCarryRatio = pageScrollView.zoomScale / _fixScaleFactor;
+    UIEdgeInsets inset = pageScrollView.adjustedContentInset;
+    CGFloat minX = -inset.left;
+    CGFloat maxX = pageScrollView.contentSize.width - pageScrollView.bounds.size.width + inset.right;
+    CGFloat fracX = (maxX - minX > 1) ? (pageScrollView.contentOffset.x - minX) / (maxX - minX) : 0.5;
+    _pagingCarryFracX = MIN(MAX(fracX, 0), 1);
+    // The page being left is not an "incoming" page for this turn.
+    objc_setAssociatedObject(pageScrollView, kRNPDFPagingCarryTokenKey, @(_pagingCarryToken), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    PGDBG(@"paging:Page turn started on page %d: scale=%.3f fracX=%.3f",
+               _pagingCarryFromPage, _pagingCarryRatio, _pagingCarryFracX);
+}
+
+// Gives a page scroller the carried zoom: same scale and horizontal position as the page
+// being left, entering at the top of the next page / bottom of the previous one (what
+// continuous scrolling would show). At ~1x it only undoes a stale zoom left on a reused
+// neighbor page.
+- (void)applyPagingZoomCarryToScrollView:(UIScrollView *)scrollView showTopEdge:(BOOL)showTopEdge reason:(NSString *)reason {
+    [self hookScrollViewDelegateIfNeeded:scrollView];
+    [self applyZoomLimitsToScrollView:scrollView];
+    CGFloat zoomBefore = scrollView.zoomScale;
+    CGPoint offsetBefore = scrollView.contentOffset;
+    if (_pagingCarryRatio > 1.01f) {
+        CGFloat target = MIN(MAX(_pagingCarryRatio * _fixScaleFactor, scrollView.minimumZoomScale), scrollView.maximumZoomScale);
+        if (fabs(scrollView.zoomScale - target) > 0.001) {
+            [scrollView setZoomScale:target animated:NO];
+        }
+        UIEdgeInsets inset = scrollView.adjustedContentInset;
+        CGPoint offset = scrollView.contentOffset;
+        CGFloat minX = -inset.left;
+        CGFloat maxX = scrollView.contentSize.width - scrollView.bounds.size.width + inset.right;
+        if (maxX > minX) offset.x = minX + _pagingCarryFracX * (maxX - minX);
+        CGFloat minY = -inset.top;
+        CGFloat maxY = scrollView.contentSize.height - scrollView.bounds.size.height + inset.bottom;
+        if (maxY > minY) offset.y = showTopEdge ? minY : maxY;
+        if (!CGPointEqualToPoint(offset, scrollView.contentOffset)) {
+            [scrollView setContentOffset:offset animated:NO];
+        }
+    } else if (scrollView.zoomScale > scrollView.minimumZoomScale + 0.001) {
+        [scrollView setZoomScale:scrollView.minimumZoomScale animated:NO];
+    }
+    if (fabs(scrollView.zoomScale - zoomBefore) > 0.001 || !CGPointEqualToPoint(offsetBefore, scrollView.contentOffset)) {
+        PGDBG(@"paging:Zoom carry -> %@ page: zoom %.3f -> %.3f (scale %.3f), offset %@ -> %@, %@ edge",
+                   reason, zoomBefore, scrollView.zoomScale, _pagingCarryRatio,
+                   NSStringFromCGPoint(offsetBefore), NSStringFromCGPoint(scrollView.contentOffset),
+                   showTopEdge ? @"top" : @"bottom");
+    }
+}
+
+// Called on every page-turn scroller frame while a turn is in flight: give each page as it
+// starts sliding into view the carried zoom, so it arrives already zoomed instead of
+// popping in at fit and snapping to the zoom only once the turn has settled.
+- (void)applyPagingZoomCarryToIncomingPages {
+    if (!_pagingCarryValid) return;
+    NSMutableArray<UIScrollView *> *candidates = [NSMutableArray array];
+    [self collectPageZoomScrollViewsInView:_pdfView depth:0 into:candidates];
+    UIScrollView *fromScrollView = _pagingCarryFromScrollView;
+    CGRect fromFrame = fromScrollView ? [fromScrollView convertRect:fromScrollView.bounds toView:_pdfView] : CGRectZero;
+    for (UIScrollView *candidate in candidates) {
+        if (candidate == fromScrollView) continue;
+        NSNumber *appliedToken = objc_getAssociatedObject(candidate, kRNPDFPagingCarryTokenKey);
+        if (appliedToken && appliedToken.integerValue == _pagingCarryToken) continue;
+        if ([self visibleFractionOfScrollView:candidate] <= 0) continue;
+        CGRect frame = [candidate convertRect:candidate.bounds toView:_pdfView];
+        BOOL incomingFromBelow = (fromScrollView && fromScrollView.window)
+            ? CGRectGetMinY(frame) > CGRectGetMinY(fromFrame)
+            : CGRectGetMinY(frame) > 0;
+        objc_setAssociatedObject(candidate, kRNPDFPagingCarryTokenKey, @(_pagingCarryToken), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        _pagingCarryIncomingScrollView = candidate;
+        _pagingCarryIncomingFromBelow = incomingFromBelow;
+        [self applyPagingZoomCarryToScrollView:candidate showTopEdge:incomingFromBelow reason:@"incoming"];
+    }
+}
+
+// Runs once a finger-driven page turn has fully settled (still in the Settling state, so
+// zoom changes made here are not reported to JS as user zooms).
+- (void)finishPagingTransitionAfterSettle {
+    // UIPageViewController creates a scroll view for every newly shown page.
+    [self configureScrollView:_pdfView enabled:_scrollEnabled depth:0];
+
+    if (_pagingCarryValid) {
+        _pagingCarryValid = NO;
+        UIScrollView *visible = [self visiblePageZoomScrollView];
+        UIScrollView *fromScrollView = _pagingCarryFromScrollView;
+        if (visible && visible != fromScrollView) {
+            CGFloat expected = _pagingCarryRatio > 1.01f
+                ? MIN(MAX(_pagingCarryRatio * _fixScaleFactor, visible.minimumZoomScale), visible.maximumZoomScale)
+                : visible.minimumZoomScale;
+            if (fabs(visible.zoomScale - expected) > 0.001) {
+                // Only reached if the incoming page wasn't caught mid-turn, or PDFKit reset
+                // its zoom when it became the current page. Direction preferably from what
+                // was seen mid-turn, else from where the page we left now sits (above = we
+                // moved forward) while it's still on screen; page numbers only as a last
+                // resort - the page number is exactly what may not have been updated yet.
+                BOOL movedForward;
+                if (visible == _pagingCarryIncomingScrollView) {
+                    movedForward = _pagingCarryIncomingFromBelow;
+                } else if (fromScrollView && fromScrollView.window && visible.window) {
+                    CGRect fromFrame = [fromScrollView convertRect:fromScrollView.bounds toView:_pdfView];
+                    CGRect visibleFrame = [visible convertRect:visible.bounds toView:_pdfView];
+                    movedForward = CGRectGetMinY(fromFrame) < CGRectGetMinY(visibleFrame);
+                } else {
+                    int currentPage = _pdfView.currentPage ? (int)[_pdfDocument indexForPage:_pdfView.currentPage] + 1 : _page;
+                    movedForward = currentPage >= _pagingCarryFromPage;
+                }
+                [self applyPagingZoomCarryToScrollView:visible showTopEdge:movedForward reason:@"settled"];
+            }
+        }
+    }
+
+    [self reconcileCurrentPageAfterSettle];
+}
+
+// The page actually on screen right now, per PDFKit's own geometry (the page under the
+// view's center, else the only visible page). -1 if it can't tell.
+- (int)onScreenPageNumber {
+    if (!_pdfDocument || !_pdfView) return -1;
+    CGPoint mid = CGPointMake(CGRectGetMidX(_pdfView.bounds), CGRectGetMidY(_pdfView.bounds));
+    PDFPage *centerPage = [_pdfView pageForPoint:mid nearest:YES];
+    if (centerPage) {
+        return (int)[_pdfDocument indexForPage:centerPage] + 1;
+    }
+    NSArray<PDFPage *> *visible = _pdfView.visiblePages;
+    if (visible.count == 1) {
+        return (int)[_pdfDocument indexForPage:visible.firstObject] + 1;
+    }
+    return -1;
+}
+
+// Paged mode: PDFKit doesn't commit a finger-driven page turn - update currentPage and
+// post PDFViewPageChangedNotification - until the NEXT touch begins. Device trace
+// (2026-10-02), identical on every swipe: at scrollViewDidEndDecelerating: currentPage was
+// still the old page while visiblePages/pageForPoint already showed the new one, the
+// page-turn teardown callback never came, and the page-changed notification only arrived
+// the moment the user started the next swipe - so the page number lagged exactly one swipe
+// behind, and stayed wrong for good if they stopped swiping. What's on screen is known as
+// soon as the turn comes to rest, so report that instead of waiting for PDFKit.
+// PDFKit's own (late) notification for the same page then lands as a harmless repeat.
+- (void)reportOnScreenPageIfChanged:(NSString *)reason {
+    if (!_pdfDocument || !_currentUsePageViewController) return;
+    if (_isNavigating || _page != _previousPage) {
+        // A JS-requested navigation is pending/in flight - it decides the page, not us.
+        PGDBG(@"on-screen page check (%@) skipped - JS navigation pending %@", reason, [self pgdbgSnapshot]);
+        return;
+    }
+    int onScreenPage = [self onScreenPageNumber];
+    if (onScreenPage < 1 || onScreenPage == _page) {
+        PGDBG(@"on-screen page check (%@): page %d already reported %@", reason, onScreenPage, [self pgdbgSnapshot]);
+        return;
+    }
+    PGDBG(@"on-screen page check (%@): showing page %d but last reported %d - reporting now %@",
+          reason, onScreenPage, _page, [self pgdbgSnapshot]);
+    _page = onScreenPage;
+    _previousPage = onScreenPage;
+    _displayPage = onScreenPage;
+    _pageCount = (int)_pdfDocument.pageCount;
+    if (_enablePreloading) {
+        [self preloadAdjacentPages:_page];
+    }
+    [self notifyOnChangeWithMessage:[NSString stringWithFormat:@"pageChanged|%d|%lu",
+                                     onScreenPage, (unsigned long)_pdfDocument.pageCount]];
+    if (_highlightOverlay) [_highlightOverlay setNeedsDisplay];
+}
+
+// Settle-time safety net for the same thing (e.g. a turn that ended via an animation
+// rather than deceleration, where scrollViewDidEndDecelerating: never fired).
+- (void)reconcileCurrentPageAfterSettle {
+    [self reportOnScreenPageIfChanged:@"settle"];
 }
 
 #pragma mark - UIScrollViewDelegate
@@ -2200,6 +2810,10 @@ using namespace facebook::react;
     // Redraw highlight overlay so rects stay aligned when user scrolls (pan).
     if (_highlightOverlay) {
         [self refreshHighlightOverlayContainer];
+    }
+    if (_pagingCarryValid && _currentUsePageViewController &&
+        _pageTransitionState != RNPDFPageTransitionIdle && [self isPageTurnScrollView:scrollView]) {
+        [self applyPagingZoomCarryToIncomingPages];
     }
     static int scrollEventCount = 0;
     scrollEventCount++;
@@ -2273,6 +2887,14 @@ using namespace facebook::react;
 - (void)updateDisplayPageForScrollIfNeeded {
     BOOL usingPageViewController = _enablePaging && !_horizontal;
     if (!_pdfDocument || usingPageViewController) {
+        return;
+    }
+    // While the single-page-view toggle is rebuilding PDFKit's view, PDFKit transiently
+    // sits on page 1 before reconfigureUsePageViewControllerIfNeededWithRetriesLeft:
+    // steers it back - reporting that flashed "1/N" in the page indicator for a frame
+    // (device trace 2026-10-02: displayPageChanged 1 then 6 within 60ms of a toggle).
+    // The first scroll after the rebuild reports the real page.
+    if (_isReconfiguringPageViewController) {
         return;
     }
     NSArray<PDFPage *> *visiblePages = _pdfView.visiblePages;
@@ -2351,10 +2973,20 @@ using namespace facebook::react;
 // only option before that swizzle existed; now that we're already hooked
 // into the real completion callback, releasing off it is both more correct
 // and, in practice, faster than the old blind wait.
+//
+// 2026-10-02: the "teardown notification missing on ordinary swipes" noted below
+// was not UIKit being unreliable - UIPageViewController had been cut off from its
+// own page-turn scroller (see RNPDFScrollViewDelegateProxy), so that callback
+// genuinely never ran. With the delegate chain intact it fires on every manual
+// page turn; it can also land just *before* scrollViewDidEnd{Dragging,
+// Decelerating}: reaches us, which _pagingTeardownSeenGeneration covers.
 - (void)beginSettlingAfterUserGestureEnd {
+    BOOL usingPageViewController = _enablePaging && !_horizontal;
+    BOOL teardownAlreadyDone = usingPageViewController &&
+                               _pageTransitionState == RNPDFPageTransitionUserDriven &&
+                               _pagingTeardownSeenGeneration == _pageTransitionGeneration;
     _pageTransitionState = RNPDFPageTransitionSettling;
     NSInteger generation = ++_pageTransitionGeneration;
-    BOOL usingPageViewController = _enablePaging && !_horizontal;
     if (usingPageViewController) {
         _pdfView.userInteractionEnabled = NO;
     }
@@ -2365,13 +2997,32 @@ using namespace facebook::react;
         if (strongSelf->_pageTransitionGeneration != generation) {
             // A new drag started while we were waiting - that gesture owns the
             // state now, leave it alone.
+            PGDBG(@"settle SKIPPED (gen=%ld superseded by gen=%ld)", (long)generation, (long)strongSelf->_pageTransitionGeneration);
             return;
+        }
+        BOOL pagedNow = strongSelf->_currentUsePageViewController;
+        PGDBG(@"settle FIRE (gen=%ld) %@", (long)generation, [strongSelf pgdbgSnapshot]);
+        if (pagedNow) {
+            // Before going Idle: zoom changes made here must not be reported to JS
+            // as user zooms (see scrollViewDidZoom:).
+            [strongSelf finishPagingTransitionAfterSettle];
         }
         strongSelf->_pageTransitionState = RNPDFPageTransitionIdle;
         strongSelf->_pdfView.userInteractionEnabled = YES;
-        RCTLogInfo(@"👆 [iOS Scroll] page transition settled -> Idle (usingPageViewController=%d)", usingPageViewController);
+        if (pagedNow) {
+            [strongSelf syncScaleFromVisiblePageScrollView];
+            if (strongSelf->_highlightOverlay) {
+                [strongSelf refreshHighlightOverlayContainer];
+            }
+        }
+        RCTLogInfo(@"👆 [iOS Scroll] page transition settled -> Idle (usingPageViewController=%d, page=%d)",
+                   usingPageViewController, strongSelf->_page);
     };
-    if (usingPageViewController) {
+    PGDBG(@"beginSettling (gen=%ld paged=%d teardownAlreadyDone=%d)", (long)generation, usingPageViewController, teardownAlreadyDone);
+    if (usingPageViewController && teardownAlreadyDone) {
+        RCTLogInfo(@"👆 [iOS Scroll] Page-turn teardown already completed for this gesture - settling next run-loop turn");
+        dispatch_async(dispatch_get_main_queue(), settle);
+    } else if (usingPageViewController) {
         _pagingSettleBlock = settle;
         // This was meant to be a rare safety net, not the primary path - but
         // device logs from 2026-10-02 showed queuingScrollView:didEndManualScroll:...
@@ -2391,8 +3042,10 @@ using namespace facebook::react;
             if (!strongSelf || strongSelf->_pagingSettleBlock != settle) {
                 return;
             }
-            RCTLogWarn(@"⚠️ [iOS Scroll] Teardown-complete notification never arrived after 0.4s - "
-                       @"releasing paging settle via fallback timeout instead.");
+            // Normal in paged mode: PDFKit/UIPageViewController only commits a turn when
+            // the next touch begins (see reportOnScreenPageIfChanged:), so this is the
+            // usual path - trace it, don't warn.
+            PGDBG(@"Teardown-complete notification didn't arrive within 0.4s - releasing paging settle via fallback timeout");
             strongSelf->_pagingSettleBlock = nil;
             settle();
         });
@@ -2408,7 +3061,18 @@ using namespace facebook::react;
 // own paging settle is actually pending, so a notification from an unrelated
 // UIPageViewController elsewhere in the app is harmless.
 - (void)onPageTransitionTeardownComplete:(NSNotification *)notification {
+    PGDBG(@"page-turn teardown notification (settlePending=%d fingerLiftedGen=%ld) %@",
+          _pagingSettleBlock != nil, (long)_pageTurnFingerLiftedGeneration, [self pgdbgSnapshot]);
     if (!_pagingSettleBlock) {
+        if (_pageTransitionState == RNPDFPageTransitionUserDriven &&
+            _pageTurnFingerLiftedGeneration == _pageTransitionGeneration) {
+            // Arrived after this gesture's finger lifted but before
+            // scrollViewDidEndDecelerating: reached us - remember it so
+            // beginSettlingAfterUserGestureEnd doesn't wait out the fallback timer for
+            // a notification that has already come and gone. (Not while the finger is
+            // still down: that could be a late one from the previous swipe.)
+            _pagingTeardownSeenGeneration = _pageTransitionGeneration;
+        }
         return;
     }
     void (^settle)(void) = _pagingSettleBlock;
@@ -2420,14 +3084,40 @@ using namespace facebook::react;
     dispatch_async(dispatch_get_main_queue(), settle);
 }
 
+// Which scroll view's drags are page turns. Paged mode: only UIPageViewController's
+// page-turn scroller - panning around inside a zoomed page is not a page turn, and used to
+// be treated as one (locking interaction and swallowing taps after every pan) because
+// every scroll view reported into the same handlers. Continuous mode: PDFKit's single
+// scroll view.
+- (BOOL)scrollViewDrivesPageTransitionState:(UIScrollView *)scrollView {
+    if ([self isPageTurnScrollView:scrollView]) {
+        return YES;
+    }
+    return !_currentUsePageViewController;
+}
+
 - (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    PGDBG(@"scroll willBeginDragging (%@, offset=%@) %@",
+          [self pgdbgScrollViewKind:scrollView], NSStringFromCGPoint(scrollView.contentOffset), [self pgdbgSnapshot]);
+    if (![self scrollViewDrivesPageTransitionState:scrollView]) {
+        return;
+    }
     _pageTransitionState = RNPDFPageTransitionUserDriven;
     ++_pageTransitionGeneration;
+    if (_currentUsePageViewController) {
+        [self capturePagingZoomCarry];
+    }
     RCTLogInfo(@"👆 [iOS Scroll] scrollViewWillBeginDragging - enablePaging=%d, page=%d, pageCount=%lu",
               _enablePaging, _page, (unsigned long)_pdfDocument.pageCount);
 }
 
 - (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    PGDBG(@"scroll didEndDragging decelerate=%d (%@, offset=%@) %@", decelerate,
+          [self pgdbgScrollViewKind:scrollView], NSStringFromCGPoint(scrollView.contentOffset), [self pgdbgSnapshot]);
+    if (![self scrollViewDrivesPageTransitionState:scrollView]) {
+        return;
+    }
+    _pageTurnFingerLiftedGeneration = _pageTransitionGeneration;
     if (!decelerate) {
         RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDragging (no decelerate) - Settling");
         [self beginSettlingAfterUserGestureEnd];
@@ -2453,6 +3143,16 @@ using namespace facebook::react;
 }
 
 - (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    PGDBG(@"scroll didEndDecelerating (%@, offset=%@) %@",
+          [self pgdbgScrollViewKind:scrollView], NSStringFromCGPoint(scrollView.contentOffset), [self pgdbgSnapshot]);
+    if (![self scrollViewDrivesPageTransitionState:scrollView]) {
+        return;
+    }
+    if (_currentUsePageViewController) {
+        // The page turn has come to rest - report the page now on screen right away
+        // (see reportOnScreenPageIfChanged: for why PDFKit's own report comes too late).
+        [self reportOnScreenPageIfChanged:@"page turn came to rest"];
+    }
     RCTLogInfo(@"👆 [iOS Scroll] scrollViewDidEndDecelerating - Settling");
     [self beginSettlingAfterUserGestureEnd];
 }
@@ -2465,21 +3165,44 @@ using namespace facebook::react;
     if (_highlightOverlay) {
         [self refreshHighlightOverlayContainer];
     }
-    if (_fixScaleFactor > 0 && _pdfView.scaleFactor > 0) {
-        float newScale = _pdfView.scaleFactor / _fixScaleFactor;
-
-        // Only notify if scale changed significantly (prevent spam)
-        if (fabs(_scale - newScale) > 0.01f) {
-            _scale = newScale;
-            RCTLogInfo(@"🔍 [iOS Zoom] Pinch zoom - scale changed to %f", _scale);
-            [self notifyOnChangeWithMessage:[[NSString alloc] initWithString:
-                [NSString stringWithFormat:@"scaleChanged|%f", _scale]]];
+    if (_fixScaleFactor <= 0) {
+        return;
+    }
+    float newScale;
+    if (_currentUsePageViewController) {
+        // Paged mode: only a zoom of the page actually on screen is the user's zoom.
+        // Neighbor pages' scrollers (kept loaded off screen), zoom carried onto an
+        // incoming page mid-turn, and the page-turn scroller itself must not be
+        // reported - each of those used to round-trip through JS's `scale` prop and
+        // snap the visible page's zoom to the wrong value.
+        if (_pageTransitionState != RNPDFPageTransitionIdle ||
+            [self isPageTurnScrollView:scrollView] ||
+            [self visibleFractionOfScrollView:scrollView] < 0.5f) {
+            return;
         }
+        newScale = scrollView.zoomScale / _fixScaleFactor;
+    } else {
+        if (_pdfView.scaleFactor <= 0) {
+            return;
+        }
+        newScale = _pdfView.scaleFactor / _fixScaleFactor;
+    }
+
+    // Only notify if scale changed significantly (prevent spam)
+    if (fabs(_scale - newScale) > 0.01f) {
+        _scale = newScale;
+        PGDBG(@"zoom: Pinch zoom - scale changed to %f", _scale);
+        [self reportScaleToJS];
     }
 }
 
-// CRITICAL: Return the view that should be zoomed
+// CRITICAL: Return the view that should be zoomed. Only reached for a scroll view whose
+// own (PDFKit) delegate doesn't answer this - see RNPDFScrollViewDelegateProxy.
 - (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
+    if ([self isPageTurnScrollView:scrollView]) {
+        // UIPageViewController's page-turn scroller never zooms.
+        return nil;
+    }
     // Search for PDFDocumentView in the scroll view's hierarchy
     for (UIView *subview in scrollView.subviews) {
         NSString *className = NSStringFromClass([subview class]);
@@ -2505,23 +3228,37 @@ using namespace facebook::react;
     if (_highlightOverlay) {
         [self refreshHighlightOverlayContainer];
     }
-    RCTLogInfo(@"🔍 [iOS Zoom] Will begin zooming");
+    PGDBG(@"zoom: Will begin zooming (%@, zoomView=%@, pageTurn=%d, visible=%.2f)",
+               NSStringFromClass([scrollView class]), view ? NSStringFromClass([view class]) : @"(nil)",
+               [self isPageTurnScrollView:scrollView], [self visibleFractionOfScrollView:scrollView]);
 }
 
 - (void)scrollViewDidEndZooming:(UIScrollView *)scrollView
                         withView:(UIView *)view
                          atScale:(CGFloat)scale {
     _isLiveZooming = NO;
-    // The gesture just ended; resync the cached scale from the view's real, final
-    // scaleFactor so the next JS round trip's echoed `scale` prop is a no-op instead
-    // of (harmlessly, but needlessly) re-applying a value that's already current.
-    if (_fixScaleFactor > 0 && _pdfView.scaleFactor > 0) {
+    // The gesture just ended; resync the cached scale from the view's real, final zoom
+    // and make sure JS ends up holding that same value. Updating _scale silently (as this
+    // used to) left JS on the last mid-pinch report, so the next unrelated prop update
+    // carried that slightly-off value back down as a "change" and nudged the zoom.
+    BOOL resynced = NO;
+    if (_currentUsePageViewController) {
+        if (_fixScaleFactor > 0 && ![self isPageTurnScrollView:scrollView] &&
+            [self visibleFractionOfScrollView:scrollView] >= 0.5f) {
+            _scale = scrollView.zoomScale / _fixScaleFactor;
+            resynced = YES;
+        }
+    } else if (_fixScaleFactor > 0 && _pdfView.scaleFactor > 0) {
         _scale = _pdfView.scaleFactor / _fixScaleFactor;
+        resynced = YES;
+    }
+    if (resynced && fabs(_scale - _jsKnownScale) > 0.0001f) {
+        [self reportScaleToJS];
     }
     if (_highlightOverlay) {
         [self refreshHighlightOverlayContainer];
     }
-    RCTLogInfo(@"🔍 [iOS Zoom] Did end zooming at scale %f", scale);
+    PGDBG(@"zoom: Did end zooming at zoomScale %f (_scale=%f, JS knows %f)", scale, _scale, _jsKnownScale);
 }
 
 // Enhanced progressive loading methods

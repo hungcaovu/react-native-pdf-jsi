@@ -186,7 +186,22 @@ export default class Pdf extends Component {
             prevProps.page !== this.props.page
         ) {
             const p = Number(this.props.page);
-            if (Number.isFinite(p) && p >= 1) {
+            if (p === this._lastNativeReportedPage) {
+                // The parent is only mirroring the page native itself just reported (via
+                // onPageChanged) - not a navigation request. Forcing one here used to send a
+                // setNativePage command after every swipe; it got deferred until the next
+                // swipe had settled and then aimed back at the page the user had just left.
+                if (__DEV__) {
+                    const line = '🧷 [PGDBG][js:Pdf] page prop ' + p + ' mirrors native report - no setNativePage';
+                    console.log(line);
+                    global.__PGDBG_SINK__ && global.__PGDBG_SINK__(line);
+                }
+            } else if (Number.isFinite(p) && p >= 1) {
+                if (__DEV__) {
+                    const line = '🧷 [PGDBG][js:Pdf] page prop ' + p + ' is a JS navigation request (last native report ' + this._lastNativeReportedPage + ') - setNativePage';
+                    console.log(line);
+                    global.__PGDBG_SINK__ && global.__PGDBG_SINK__(line);
+                }
                 try {
                     this.setPage(p);
                 } catch (e) {
@@ -567,6 +582,16 @@ export default class Pdf extends Component {
     _onChange = (event) => {
 
         let message = event.nativeEvent.message.split('|');
+        if (message[0] === 'pgdbg') {
+            // Native PGDBG trace line forwarded to JS (debug builds only) - print it next to
+            // the JS side's own trace, and hand it to the app's log sink if it installed one.
+            if (__DEV__) {
+                const line = message.slice(1).join('|');
+                console.log(line);
+                global.__PGDBG_SINK__ && global.__PGDBG_SINK__(line);
+            }
+            return;
+        }
         if (__DEV__) {
             console.log("📥 [Pdf] onChange received:", message[0], "full message:", event.nativeEvent.message);
         }
@@ -665,6 +690,19 @@ export default class Pdf extends Component {
                 // Only apply splice logic for non-loadComplete messages
                 message[4] = message.splice(4).join('|');
             } else if (message[0] === 'pageChanged') {
+                if (__DEV__) {
+                    // PGDBG page-number trace: message[3] is native's event sequence number.
+                    const line = '🧷 [PGDBG][js:Pdf] <- native pageChanged ' + JSON.stringify({
+                        ts: Date.now(),
+                        page: Number(message[1]),
+                        total: Number(message[2]),
+                        nativeSeq: message[3] !== undefined ? Number(message[3]) : null,
+                        hasOnPageChanged: !!this.props.onPageChanged,
+                    });
+                    console.log(line);
+                    global.__PGDBG_SINK__ && global.__PGDBG_SINK__(line);
+                }
+                this._lastNativeReportedPage = Number(message[1]);
                 this.props.onPageChanged && this.props.onPageChanged(Number(message[1]), Number(message[2]));
             } else if (message[0] === 'displayPageChanged') {
                 this.props.onDisplayPageChanged && this.props.onDisplayPageChanged(Number(message[1]), Number(message[2]));
