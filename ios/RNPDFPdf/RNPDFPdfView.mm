@@ -871,6 +871,9 @@ using namespace facebook::react;
 #ifndef __OPTIMIZE__
     sPgdbgForwardView = self;
 #endif
+    // onPageChanged: drops every page change while this is set, so a view must never start
+    // (or be recycled) with it left on.
+    _isReconfiguringPageViewController = NO;
     _pagingCarryValid = NO;
     _pagingTeardownSeenGeneration = -1;
     _pageTurnFingerLiftedGeneration = -1;
@@ -1471,11 +1474,36 @@ using namespace facebook::react;
             [self reconfigureUsePageViewControllerIfNeededWithRetriesLeft:10];
         }
 
-        if (_pdfDocument && ([effectiveChangedProps containsObject:@"path"] || [changedProps containsObject:@"singlePage"])) {
+        // Runs after the usePageViewController reconfigure above, so the continuous-mode
+        // branch is the one that re-asserts displayMode once paging has just been switched
+        // off - hence "enablePaging"/"horizontal" are in the trigger list too, not only
+        // "path"/"singlePage".
+        if (_pdfDocument && ([effectiveChangedProps containsObject:@"path"] ||
+                             [changedProps containsObject:@"singlePage"] ||
+                             [changedProps containsObject:@"enablePaging"] ||
+                             [changedProps containsObject:@"horizontal"])) {
             if (_singlePage) {
                 _pdfView.displayMode = kPDFDisplaySinglePage;
                 _pdfView.userInteractionEnabled = NO;
                 RCTLogInfo(@"📄 [iOS Scroll] Set to SINGLE PAGE mode (userInteractionEnabled=NO)");
+            } else if (shouldUsePageViewController) {
+                // Deliberately does NOT write displayMode. PDFKit documents it as ignored
+                // while a UIPageViewController owns the layout ("layout is always assumed
+                // single page continuous", PDFView.h), but writing it anyway tears that
+                // controller back down and leaves the plain continuous scroller in its
+                // place. That hit every *first* load that already had enablePaging=true,
+                // because this block runs on "path" immediately after
+                // reconfigureUsePageViewControllerIfNeeded... has just switched paging on.
+                // The reader's runtime "Single page view" toggle never hit it - flipping
+                // only `enablePaging` didn't re-enter this block back when it keyed off
+                // "path"/"singlePage" alone - which is why paged mode worked when toggled
+                // but not when it was already on at open. Caught on device (2026-10-02) on
+                // the header/footer margin screen, which always mounts with paging on: its
+                // supposedly single-page preview scrolled, showed the top of the *next*
+                // page below the current one, and left both drag handles misplaced
+                // (that screen's JS geometry assumes PDFKit's centered single-page layout).
+                _pdfView.userInteractionEnabled = YES;
+                RCTLogInfo(@"📄 [iOS Scroll] Paged mode - leaving displayMode to UIPageViewController");
             } else {
                 _pdfView.displayMode = kPDFDisplaySinglePageContinuous;
                 _pdfView.userInteractionEnabled = YES;
@@ -1579,7 +1607,17 @@ using namespace facebook::react;
         // Use pathActuallyChanged instead of checking changedProps to ensure we only handle initial page when path actually changed
         if (_pdfDocument && pathActuallyChanged && _documentLoaded) {
             PDFPage *pdfPage = [_pdfDocument pageAtIndex:_page-1];
-            if (pdfPage && _page == 1) {
+            if (pdfPage && shouldUsePageViewController) {
+                // Paged mode now genuinely engages on the very first load (see the
+                // displayMode guard above), so this initial jump has to take the same
+                // deferred, transition-aware path every other paged navigation takes,
+                // rather than calling goToDestination:/goToRect:onPage: straight into a
+                // UIPageViewController that is still being assembled.
+                int initialTargetPage = _page;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self navigateToPageForPagingMode:pdfPage targetPage:initialTargetPage retriesLeft:10];
+                });
+            } else if (pdfPage && _page == 1) {
                 // Special case workaround for first page alignment
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self->_pdfView goToRect:CGRectMake(0, NSUIntegerMax, 1, 1) onPage:pdfPage];
@@ -2027,13 +2065,16 @@ using namespace facebook::react;
             return;
         }
 
-        // Same transient PDFKit reset as above, but triggered by toggling the single-page-
-        // view switch mid-document instead of an initial load — see
-        // _isReconfiguringPageViewController's declaration for why `_previousPage == -1`
-        // alone doesn't catch this case. reconfigureUsePageViewControllerIfNeededWithRetriesLeft:
-        // restores the real page itself once the rebuild settles, so just drop this one here.
-        if (_isReconfiguringPageViewController && _page != 1 && newPage == 1) {
-            PGDBG(@"onPageChanged DROPPED (guard: transient default-to-page-1 during usePageViewController reconfigure, real page %d)", _page);
+        // Toggling the single-page-view switch mid-document rebuilds PDFKit's view, and every
+        // page change PDFKit posts during that rebuild is transient: its reset to page 1
+        // (see _isReconfiguringPageViewController's declaration), and also its stale
+        // paged-mode currentPage - device trace 2026-10-02: toggling to continuous while on
+        // page 4 posted page 3 (paged mode commits turns late, see
+        // reportOnScreenPageIfChanged:) before the restore posted 4, which would flash
+        // "3/N". reconfigureUsePageViewControllerIfNeededWithRetriesLeft: restores the real
+        // page (_page, which JS already has) once the rebuild settles, so drop all of them.
+        if (_isReconfiguringPageViewController) {
+            PGDBG(@"onPageChanged DROPPED (single-page-view toggle rebuilding; PDFKit says %d, real page %d)", newPage, _page);
             return;
         }
 
