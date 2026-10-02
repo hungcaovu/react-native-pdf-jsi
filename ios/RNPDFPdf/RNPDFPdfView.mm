@@ -2373,20 +2373,25 @@ using namespace facebook::react;
     };
     if (usingPageViewController) {
         _pagingSettleBlock = settle;
-        // Safety net, not the primary path: queuingScrollView:didEndManualScroll:...
-        // is believed to fire for every manual scroll end, but that's reverse-
-        // engineered behavior (see UIPageViewController+RNPDFCrashGuard.mm), not a
-        // documented guarantee - e.g. a drag too small/slow to trigger a real page-
-        // turn transition may never reach it. Without this, a missed notification
-        // would leave _pdfView.userInteractionEnabled = NO permanently (worse than
-        // the 350ms wait it replaced). 1.5s is well past any legitimate transition,
-        // so this firing at all means the real signal was missed, not just slow.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // This was meant to be a rare safety net, not the primary path - but
+        // device logs from 2026-10-02 showed queuingScrollView:didEndManualScroll:...
+        // (see UIPageViewController+RNPDFCrashGuard.mm) missing on *ordinary* swipes,
+        // not just the boundary-race edge case, which made this fallback the common
+        // path instead of the exception. At 1.5s that meant every normal page-turn
+        // held _pdfView.userInteractionEnabled = NO for a user-perceptible freeze,
+        // and a second swipe landing right as it unlocked would queue up and fire
+        // as an extra page-turn once released - the reported "swipe once, jump two
+        // pages" / "keeps letting me swipe" symptom. Shortened to comfortably outlast
+        // UIPageViewController's own ~0.3s transition animation (this is close to the
+        // 350ms fixed delay this notification-based settle originally replaced) so the
+        // common case no longer freezes interaction for a visible stretch, while still
+        // acting as a backstop for a genuinely missed notification.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             __typeof(self) strongSelf = weakSelf;
             if (!strongSelf || strongSelf->_pagingSettleBlock != settle) {
                 return;
             }
-            RCTLogWarn(@"⚠️ [iOS Scroll] Teardown-complete notification never arrived after 1.5s - "
+            RCTLogWarn(@"⚠️ [iOS Scroll] Teardown-complete notification never arrived after 0.4s - "
                        @"releasing paging settle via fallback timeout instead.");
             strongSelf->_pagingSettleBlock = nil;
             settle();
