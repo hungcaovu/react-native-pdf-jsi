@@ -15,6 +15,12 @@
 #import <PDFKit/PDFKit.h>
 #import <dispatch/dispatch.h>
 
+@interface PDFJSIManager ()
+// Written on the module queue by start/stopObserving, read from _searchQueue
+// inside the batch-search loop, so it has to be atomic.
+@property (atomic, assign) BOOL hasListeners;
+@end
+
 @implementation PDFJSIManager {
     BOOL _isJSIInitialized;
     dispatch_queue_t _backgroundQueue;
@@ -51,25 +57,31 @@ RCT_EXPORT_MODULE(PDFJSIManager);
 #pragma mark - JSI Initialization
 
 - (void)initializeJSI {
-    dispatch_async(_backgroundQueue, ^{
-        @try {
-            // Initialize JSI module (iOS implementation)
-            self->_isJSIInitialized = YES;
-            RCTLogInfo(@"✅ PDF JSI initialized successfully for iOS");
-            
-            // Send initialization event
-            [self sendEventWithName:@"PDFJSIEvent" body:@{
-                @"type": @"initialized",
-                @"success": @YES,
-                @"platform": @"ios",
-                @"message": @"PDF JSI initialized successfully"
-            }];
-            
-        } @catch (NSException *exception) {
-            RCTLogError(@"❌ Failed to initialize PDF JSI: %@", exception.reason);
-            self->_isJSIInitialized = NO;
-        }
-    });
+    // Runs from -init, which React Native calls BEFORE it injects callableJSModules.
+    // Nothing here may emit an event yet — sendEventWithName: would raise
+    // "RCTCallableJSModules is not set". The "initialized" event is emitted from
+    // -startObserving instead, once a listener exists and injection has happened.
+    _isJSIInitialized = YES;
+    RCTLogInfo(@"✅ PDF JSI initialized successfully for iOS");
+}
+
+#pragma mark - RCTEventEmitter Observation
+
+- (void)startObserving {
+    self.hasListeners = YES;
+
+    if (_isJSIInitialized) {
+        [self sendEventWithName:@"PDFJSIEvent" body:@{
+            @"type": @"initialized",
+            @"success": @YES,
+            @"platform": @"ios",
+            @"message": @"PDF JSI initialized successfully"
+        }];
+    }
+}
+
+- (void)stopObserving {
+    self.hasListeners = NO;
 }
 
 #pragma mark - JSI Availability Check
@@ -471,7 +483,7 @@ RCT_EXPORT_METHOD(searchTextBatchDirect:(NSString *)pdfId
                 }
 
                 done += 1;
-                if (done % 20 == 0 || done == total) {
+                if ((done % 20 == 0 || done == total) && self.hasListeners) {
                     [self sendEventWithName:@"PDFTextSearchProgress" body:@{ @"done": @(done), @"total": @(total) }];
                 }
             }
