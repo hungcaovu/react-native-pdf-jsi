@@ -187,6 +187,7 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
     private boolean enableAntialiasing = true;
     private boolean enableAnnotationRendering = true;
     private boolean enableDoubleTapZoom = true;
+    private boolean nightModeEnabled = false;
 
     private boolean enablePaging = false;
     private boolean autoSpacing = false;
@@ -710,6 +711,7 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
                 .enableSwipe(!this.singlePage && this.scrollEnabled)
                 .enableDoubletap(!this.singlePage && this.enableDoubleTapZoom)
                 .enableAnnotationRendering(this.enableAnnotationRendering)
+                .nightMode(this.nightModeEnabled)
                 .linkHandler(this);
 
             if (this.singlePage) {
@@ -834,6 +836,24 @@ public class PdfView extends PDFView implements OnPageChangeListener,OnLoadCompl
 
     public void setEnableAnnotationRendering(boolean enableAnnotationRendering) {
         this.enableAnnotationRendering = enableAnnotationRendering;
+    }
+
+    /**
+     * Dark/night mode for the page content. PDFView applies it as an inverting
+     * ColorMatrix filter on the paint its page bitmaps are drawn with, so flipping it
+     * only needs a redraw — no document reload, no lost scroll position. Our own
+     * highlight/skip-zone drawing (see onLayerDrawn) doesn't go through that paint, so it
+     * keeps its real colours. Also fed to the Configurator in loadPdf() so it survives a
+     * reload.
+     *
+     * Named setNightModeEnabled, not setNightMode: PDFView already has a
+     * setNightMode(boolean) that this calls through to.
+     */
+    public void setNightModeEnabled(boolean nightMode) {
+        if (this.nightModeEnabled == nightMode) return;
+        this.nightModeEnabled = nightMode;
+        super.setNightMode(nightMode);
+        invalidate();
     }
 
     public void setEnablePaging(boolean enablePaging) {

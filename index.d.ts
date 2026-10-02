@@ -68,6 +68,17 @@ export interface PdfProps {
      * Enable rendering of PDF annotations
      */
     enableAnnotationRendering?: boolean,
+
+    /**
+     * Dark/night mode for the rendered page content: white paper -> black, black text ->
+     * white (iOS inverts PDFKit's page layer with a difference blend, Android via
+     * PDFView's night mode). Only the pages invert — the gutter around them keeps the
+     * view's background colour, photos and figures keep their real colours, and
+     * highlight/skip-zone rects keep theirs.
+     *
+     * @default false
+     */
+    nightMode?: boolean,
     /**
      * Enable double-tap to zoom functionality
      */

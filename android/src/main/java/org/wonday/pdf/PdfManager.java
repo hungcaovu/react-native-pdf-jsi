@@ -145,6 +145,11 @@ public class PdfManager extends SimpleViewManager<PdfView> implements RNPDFPdfVi
         pdfView.setEnableAnnotationRendering(enableAnnotationRendering);
     }
 
+    @ReactProp(name = "nightMode")
+    public void setNightMode(PdfView pdfView, boolean nightMode) {
+        pdfView.setNightModeEnabled(nightMode);
+    }
+
     @ReactProp(name = "enableDoubleTapZoom")
     public void setEnableDoubleTapZoom(PdfView pdfView, boolean enableDoubleTap) {
         pdfView.setEnableDoubleTapZoom(enableDoubleTap);

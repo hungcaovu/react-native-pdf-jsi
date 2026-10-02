@@ -64,6 +64,8 @@ UIView
 @property(nonatomic) BOOL enableRTL;
 @property(nonatomic) BOOL enableAnnotationRendering;
 @property(nonatomic) BOOL enableDoubleTapZoom;
+/** Inverts the rendered page content (PDFKit has no night mode of its own) — see RNPDFNightPage in the .mm. */
+@property(nonatomic) BOOL nightMode;
 @property(nonatomic) int fitPolicy;
 @property(nonatomic) int spacing;
 @property(nonatomic, strong) NSString *password;

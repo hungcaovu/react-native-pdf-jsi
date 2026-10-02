@@ -26,6 +26,7 @@
    enablePaging: ?boolean,
    enableRTL: ?boolean,
    enableAnnotationRendering: ?boolean,
+   nightMode: ?boolean,
    showsHorizontalScrollIndicator: ?boolean,
    showsVerticalScrollIndicator: ?boolean,
   scrollEnabled: ?boolean,

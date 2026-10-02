@@ -59,6 +59,8 @@
 // RNPDFPgdbgLog below), so it shows up in Metro next to the JS side's lines.
 // Debug builds only: in release the macro compiles to nothing, arguments included.
 #ifndef __OPTIMIZE__
+// Forward-declared so the macro is usable from the page class above its definition.
+static void RNPDFPgdbgLog(NSString *line);
 #define PGDBG( s, ... ) RNPDFPgdbgLog( [NSString stringWithFormat:@"🧷 [PGDBG][native] " s, ##__VA_ARGS__] )
 #else
 #define PGDBG( s, ... ) do {} while (0)
@@ -187,6 +189,178 @@ const float MIN_SCALE = 1.0f;
         }
     }
 }
+@end
+
+#pragma mark - Night mode
+
+/** Night-mode state, stored on the PDFDocument rather than captured by the page objects.
+ *
+ *  PDFKit builds page objects lazily through -classForPage: on the document delegate and
+ *  then keeps them, so swapping the page class when nightMode flips would only reach the
+ *  pages it has not built yet. Every page is an RNPDFNightPage from the start instead, and
+ *  reads this flag per draw. */
+static const void *kRNPDFNightModeKey = &kRNPDFNightModeKey;
+
+static BOOL RNPDFNightModeEnabled(PDFDocument *document) {
+    if (!document) return NO;
+    return [objc_getAssociatedObject(document, kRNPDFNightModeKey) boolValue];
+}
+
+static void RNPDFSetNightModeEnabled(PDFDocument *document, BOOL enabled) {
+    if (!document) return;
+    objc_setAssociatedObject(document, kRNPDFNightModeKey, @(enabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+
+/** Dark-mode PDF pages. PDFKit has no night mode of its own (unlike Android's
+ *  PDFView.setNightMode, which is a ColorMatrix filter on the paint its page bitmaps are
+ *  drawn with), so the page is inverted - c -> 1 - c, white paper to black, black text to
+ *  white - by a difference blend on PDFKit's own page layer: see
+ *  -applyNightPaperToPageView:, which is also where the reasoning for doing it there lives.
+ *
+ *  This class is the other half of that: it pre-inverts the photos and figures while the
+ *  page draws, so the composite inversion takes just those back to their real colours.
+ *  (Difference-blend is its own inverse.)
+ *
+ *  The inversion is confined to the page layer, so the gutter and page gaps keep whatever
+ *  themed background sits behind PDFKit, and the sentence highlight - HighlightOverlayView
+ *  above, a subview of PDFKit's zooming content view, composited above the pages - keeps
+ *  its real colours. Pre-inverting that one isn't possible anyway: inverting a translucent
+ *  fill over near-white paper is always near-black. */
+/** Mutable scan state threaded through the CGPDFScanner callbacks below. */
+@interface RNPDFImageScan : NSObject
+@property (nonatomic) CGAffineTransform ctm;
+@property (nonatomic, strong) NSMutableArray<NSValue *> *ctmStack;
+@property (nonatomic, strong) NSMutableArray<NSValue *> *rects;
+@property (nonatomic) CGPDFContentStreamRef stream;
+@end
+
+@implementation RNPDFImageScan
+@end
+
+static void RNPDFScanPushGState(CGPDFScannerRef scanner, void *info) {
+    RNPDFImageScan *scan = (__bridge RNPDFImageScan *)info;
+    [scan.ctmStack addObject:[NSValue valueWithCGAffineTransform:scan.ctm]];
+}
+
+static void RNPDFScanPopGState(CGPDFScannerRef scanner, void *info) {
+    RNPDFImageScan *scan = (__bridge RNPDFImageScan *)info;
+    if (scan.ctmStack.count == 0) return;
+    scan.ctm = [scan.ctmStack.lastObject CGAffineTransformValue];
+    [scan.ctmStack removeLastObject];
+}
+
+static void RNPDFScanConcatCTM(CGPDFScannerRef scanner, void *info) {
+    RNPDFImageScan *scan = (__bridge RNPDFImageScan *)info;
+    // Operands come off the stack in reverse: `a b c d e f cm`.
+    CGPDFReal f, e, d, c, b, a;
+    if (!CGPDFScannerPopNumber(scanner, &f) || !CGPDFScannerPopNumber(scanner, &e) ||
+        !CGPDFScannerPopNumber(scanner, &d) || !CGPDFScannerPopNumber(scanner, &c) ||
+        !CGPDFScannerPopNumber(scanner, &b) || !CGPDFScannerPopNumber(scanner, &a)) {
+        return;
+    }
+    scan.ctm = CGAffineTransformConcat(CGAffineTransformMake(a, b, c, d, e, f), scan.ctm);
+}
+
+static void RNPDFScanDrawXObject(CGPDFScannerRef scanner, void *info) {
+    RNPDFImageScan *scan = (__bridge RNPDFImageScan *)info;
+    const char *name = NULL;
+    if (!CGPDFScannerPopName(scanner, &name) || !name) return;
+
+    CGPDFObjectRef object = CGPDFContentStreamGetResource(scan.stream, "XObject", name);
+    if (!object) return;
+    CGPDFStreamRef xobject = NULL;
+    if (!CGPDFObjectGetValue(object, kCGPDFObjectTypeStream, &xobject) || !xobject) return;
+    CGPDFDictionaryRef dict = CGPDFStreamGetDictionary(xobject);
+    const char *subtype = NULL;
+    if (!dict || !CGPDFDictionaryGetName(dict, "Subtype", &subtype) || !subtype) return;
+    if (strcmp(subtype, "Image") != 0) return;
+
+    // A PDF image always occupies the unit square in its own space; the CTM in force at
+    // the `Do` places and sizes it on the page.
+    [scan.rects addObject:[NSValue valueWithCGRect:CGRectApplyAffineTransform(CGRectMake(0, 0, 1, 1), scan.ctm)]];
+}
+
+@interface RNPDFNightPage : PDFPage {
+    NSArray<NSValue *> *_imageRects;
+    BOOL _imageRectsScanned;
+}
+@end
+
+@implementation RNPDFNightPage
+
+/** Page-space rects of every image drawn by this page's content stream, scanned once and
+ *  kept — PDFKit calls -drawWithBox:toContext: again for every tile and every zoom step,
+ *  and walking the content stream each time would be absurd.
+ *
+ *  Known gaps, both deliberate: images drawn inside a /Form XObject aren't found (the
+ *  scanner doesn't recurse into form streams), and inline images (BI/ID/EI) aren't
+ *  either. Both end up inverted along with the text, i.e. the old behaviour. */
+- (NSArray<NSValue *> *)rnpdf_imageRects {
+    @synchronized (self) {
+        if (_imageRectsScanned) return _imageRects;
+        _imageRectsScanned = YES;
+        _imageRects = @[];
+
+        CGPDFPageRef pageRef = self.pageRef;
+        if (!pageRef) return _imageRects;
+
+        RNPDFImageScan *scan = [RNPDFImageScan new];
+        scan.ctm = CGAffineTransformIdentity;
+        scan.ctmStack = [NSMutableArray array];
+        scan.rects = [NSMutableArray array];
+
+        CGPDFContentStreamRef stream = CGPDFContentStreamCreateWithPage(pageRef);
+        scan.stream = stream;
+
+        CGPDFOperatorTableRef table = CGPDFOperatorTableCreate();
+        CGPDFOperatorTableSetCallback(table, "q", RNPDFScanPushGState);
+        CGPDFOperatorTableSetCallback(table, "Q", RNPDFScanPopGState);
+        CGPDFOperatorTableSetCallback(table, "cm", RNPDFScanConcatCTM);
+        CGPDFOperatorTableSetCallback(table, "Do", RNPDFScanDrawXObject);
+
+        CGPDFScannerRef scanner = CGPDFScannerCreate(stream, table, (__bridge void *)scan);
+        CGPDFScannerScan(scanner);
+        CGPDFScannerRelease(scanner);
+        CGPDFOperatorTableRelease(table);
+        CGPDFContentStreamRelease(stream);
+
+        _imageRects = [scan.rects copy];
+        return _imageRects;
+    }
+}
+
+- (void)drawWithBox:(PDFDisplayBox)box toContext:(CGContextRef)context {
+    [super drawWithBox:box toContext:context];
+    if (!RNPDFNightModeEnabled(self.document)) return;
+
+    // The page as a whole is inverted at composite time, by the difference blend put on
+    // PDFKit's own page layer (see -applyNightPaperToPageView:) - which is the only way to
+    // catch the white paper PDFKit paints there before a page's content exists. All that is
+    // left here is to pre-invert the photos and figures, so that composite inversion takes
+    // just those back to their real colours: difference-blend is its own inverse.
+    CGContextSaveGState(context);
+    CGContextSetBlendMode(context, kCGBlendModeDifference);
+    CGContextSetFillColorWithColor(context, [UIColor whiteColor].CGColor);
+
+    // The rects come from the content stream, i.e. the page's untranslated space, while
+    // PDFKit draws this page with its origin translated to the display box's corner (the
+    // same CropBox-local space HighlightOverlayView's -viewRectForParsedRect: has to undo),
+    // so they need that origin correction to land where the images actually are. One path,
+    // filled once (nonzero winding), so overlapping images don't flip twice.
+    NSArray<NSValue *> *imageRects = [self rnpdf_imageRects];
+    if (imageRects.count > 0) {
+        CGRect displayBounds = [self boundsForBox:box];
+        CGContextBeginPath(context);
+        for (NSValue *value in imageRects) {
+            CGContextAddRect(context, CGRectOffset(value.CGRectValue, -displayBounds.origin.x, -displayBounds.origin.y));
+        }
+        CGContextFillPath(context);
+    }
+
+    CGContextRestoreGState(context);
+}
+
 @end
 
 /**
@@ -412,6 +586,9 @@ typedef NS_ENUM(NSInteger, RNPDFPageTransitionState) {
 // Associated-object keys on PDFKit's scroll views (see RNPDFScrollViewDelegateProxy).
 static const void *kRNPDFScrollDelegateProxyKey = &kRNPDFScrollDelegateProxyKey;
 static const void *kRNPDFPagingCarryTokenKey = &kRNPDFPagingCarryTokenKey;
+// Holds a page view's pre-night-mode backgroundColor (NSNull for none) - see
+// -applyNightPaperToPageView:.
+static const void *kRNPDFNightPaperOriginalKey = &kRNPDFNightPaperOriginalKey;
 
 @implementation RNPDFPdfView
 {
@@ -680,6 +857,10 @@ using namespace facebook::react;
         _enableDoubleTapZoom = newProps.enableDoubleTapZoom;
         [updatedPropNames addObject:@"enableDoubleTapZoom"];
     }
+    if (_nightMode != newProps.nightMode) {
+        _nightMode = newProps.nightMode;
+        [updatedPropNames addObject:@"nightMode"];
+    }
     if (_fitPolicy != newProps.fitPolicy) {
         _fitPolicy = newProps.fitPolicy;
         [updatedPropNames addObject:@"fitPolicy"];
@@ -853,6 +1034,7 @@ using namespace facebook::react;
     _enableRTL = NO;
     _enableAnnotationRendering = YES;
     _enableDoubleTapZoom = YES;
+    _nightMode = NO;
     _fitPolicy = 2;
     _spacing = 10;
     _singlePage = NO;
@@ -927,11 +1109,9 @@ using namespace facebook::react;
     [center addObserver:self selector:@selector(onDocumentChanged:) name:PDFViewDocumentChangedNotification object:_pdfView];
     [center addObserver:self selector:@selector(onPageChanged:) name:PDFViewPageChangedNotification object:_pdfView];
     [center addObserver:self selector:@selector(onScaleChanged:) name:PDFViewScaleChangedNotification object:_pdfView];
-#ifndef __OPTIMIZE__
-    // Trace only (PGDBG): PDFKit's own "what is on screen now" signal, independent of
+    // PDFKit's own "what is on screen now" signal, independent of
     // PDFViewPageChangedNotification/currentPage which drive the page number.
     [center addObserver:self selector:@selector(onVisiblePagesChanged:) name:PDFViewVisiblePagesChangedNotification object:_pdfView];
-#endif
     // No `object:` - posted by the UIPageViewController swizzle
     // (UIPageViewController+RNPDFCrashGuard.mm), which has no reference to this
     // specific RNPDFPdfView. onPageTransitionTeardownComplete: below no-ops unless
@@ -1347,6 +1527,14 @@ using namespace facebook::react;
                     return;
                 }
 
+                // -classForPage: below only gets consulted on a document that has us as
+                // its delegate, and only for pages PDFKit has not built yet — so both the
+                // delegate and the night-mode flag have to be in place before the document
+                // reaches the view and the first page renders.
+                _pdfDocument.delegate = self;
+                RNPDFSetNightModeEnabled(_pdfDocument, _nightMode);
+                [self applyNightModeChrome];
+
                 _pdfView.document = _pdfDocument;
                 _documentLoaded = YES;
                 
@@ -1361,6 +1549,7 @@ using namespace facebook::react;
                         RCTLogInfo(@"🔍 [iOS Scroll] Retry search for scroll view after delay");
                         [self configureScrollView:self->_pdfView enabled:self->_scrollEnabled depth:0];
                     });
+
                 });
             } else {
 
@@ -1400,6 +1589,10 @@ using namespace facebook::react;
 
         if (_pdfDocument && ([effectiveChangedProps containsObject:@"path"] || [changedProps containsObject:@"enableRTL"])) {
             _pdfView.displaysRTL = _enableRTL;
+        }
+
+        if (_pdfDocument && [changedProps containsObject:@"nightMode"]) {
+            [self applyNightMode];
         }
 
         if (_pdfDocument && ([effectiveChangedProps containsObject:@"path"] || [changedProps containsObject:@"enableAnnotationRendering"])) {
@@ -1764,11 +1957,15 @@ using namespace facebook::react;
     return _currentUsePageViewController ? @"pageZoom" : @"main";
 }
 
-// Trace only - see the observer registration in initCommonProps.
+#endif // !__OPTIMIZE__ (PGDBG trace helpers)
+
+/** The earliest signal that a page view has come into use, which is when night mode's
+ *  inversion has to already be on it - see -applyNightPaperToPageView:. Also carries the
+ *  PGDBG trace of what PDFKit thinks is on screen. */
 - (void)onVisiblePagesChanged:(NSNotification *)noti {
     PGDBG(@"PDFKit visiblePagesChanged: %@", [self pgdbgSnapshot]);
+    [self applyNightPaperToPageViewsInView:_pdfView depth:0];
 }
-#endif // !__OPTIMIZE__ (PGDBG trace helpers)
 
 - (void)dealloc{
     [_preloadQueue cancelAllOperations];
@@ -1860,6 +2057,115 @@ using namespace facebook::react;
         [SearchRegistry registerPath:_pdfId path:pathToRegister];
         RCTLogInfo(@"✅ [iOS] SearchRegistry registered path for pdfId: %@ (from setPdfId)", _pdfId);
     }
+}
+
+#pragma mark - Night mode
+
+/** PDFDocumentDelegate: makes every page of this document a night-mode-capable page.
+ *  RNPDFNightPage renders exactly like a plain PDFPage while nightMode is off. */
+- (Class)classForPage {
+    return [RNPDFNightPage class];
+}
+
+/** The gutter: the area around/between pages, which is PDFKit's to paint, not ours.
+ *
+ *  PDFView.backgroundColor used to be clearColor so the RN view's background showed
+ *  through. With the overlay above that stops working wherever the overlay covers the
+ *  gutter too (paged mode, where it sits on PDFView itself): a dark gutter would invert to
+ *  a light one. So in that case PDFView is given white, which the overlay turns into the
+ *  dark gutter actually wanted. When the overlay sits inside the documentView instead, the
+ *  gutter is outside it and simply keeps the themed colour. */
+- (void)applyNightModeChrome {
+    if (!_pdfView) return;
+
+    if (@available(iOS 13.0, *)) {
+        _pdfView.overrideUserInterfaceStyle = _nightMode ? UIUserInterfaceStyleDark : UIUserInterfaceStyleLight;
+    }
+
+    UIColor *hostBackground = self.backgroundColor;
+    if (!hostBackground && self.layer.backgroundColor) {
+        // Fabric puts the view's backgroundColor straight on the layer.
+        hostBackground = [UIColor colorWithCGColor:self.layer.backgroundColor];
+    }
+
+    _pdfView.backgroundColor = hostBackground ?: [UIColor clearColor];
+}
+
+/** Turns one page view dark, or puts it back.
+ *
+ *  PDFKit renders page content asynchronously and paints the page's white paper itself in
+ *  the meantime, inside its own PDFPageLayer - so inverting while the page draws (see
+ *  RNPDFNightPage) left white paper on screen for the ~75-250ms until the first tile landed
+ *  and then snapped to dark: the "draws normally, then switches to dark mode" flash (device
+ *  trace, 2026-10-02). Nor can a view added to the page view cover that paper: device checks
+ *  the same day showed PDFKit's page layer composites above any such view whatever its
+ *  zPosition.
+ *
+ *  So the inversion goes on PDFKit's page layer itself, as a difference blend against the
+ *  white page-view background beneath it: every pixel that layer ever paints, paper and
+ *  content alike, lands inverted, and there is no gap left to flash in. */
+- (void)applyNightPaperToPageView:(UIView *)pageView {
+    CALayer *pageLayer = nil;
+    for (CALayer *sublayer in pageView.layer.sublayers) {
+        if ([NSStringFromClass([sublayer class]) isEqualToString:@"PDFPageLayer"]) {
+            pageLayer = sublayer;
+            break;
+        }
+    }
+
+    if (_nightMode) {
+        // What the difference blend above is measured against: white in, black out, so a
+        // page view with nothing painted in it yet is already the colour of a finished page.
+        if (!objc_getAssociatedObject(pageView, kRNPDFNightPaperOriginalKey)) {
+            objc_setAssociatedObject(pageView, kRNPDFNightPaperOriginalKey,
+                                     pageView.backgroundColor ?: (id)[NSNull null],
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (![pageView.backgroundColor isEqual:[UIColor whiteColor]]) {
+            pageView.backgroundColor = [UIColor whiteColor];
+        }
+        if (pageLayer && ![pageLayer.compositingFilter isEqual:@"differenceBlendMode"]) {
+            pageLayer.compositingFilter = @"differenceBlendMode";
+            PGDBG(@"night:inverted %@ of %@", NSStringFromClass([pageLayer class]),
+                  NSStringFromClass([pageView class]));
+        }
+        return;
+    }
+
+    pageLayer.compositingFilter = nil;
+    id original = objc_getAssociatedObject(pageView, kRNPDFNightPaperOriginalKey);
+    if (!original) return;  // never touched for night mode, so nothing of ours to undo
+    pageView.backgroundColor = (original == [NSNull null]) ? nil : (UIColor *)original;
+    objc_setAssociatedObject(pageView, kRNPDFNightPaperOriginalKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+/** Applies night mode to every page view currently in PDFKit's hierarchy (see -applyNightPaperToPageView:).
+ *  Cheap enough to call on a page turn or a scroll frame: there are only ever a handful of
+ *  page views. */
+- (void)applyNightPaperToPageViewsInView:(UIView *)view depth:(int)depth {
+    if (depth > 10) return;
+    if ([NSStringFromClass([view class]) containsString:@"PDFPageView"]) {
+        [self applyNightPaperToPageView:view];
+        return;
+    }
+    for (UIView *subview in view.subviews) {
+        [self applyNightPaperToPageViewsInView:subview depth:depth + 1];
+    }
+}
+
+
+/** Pushes the current nightMode value onto the document and gets the already-rendered
+ *  pages redrawn through RNPDFNightPage -drawWithBox:toContext: — the flag alone would
+ *  leave PDFKit's cached, not-yet-inverted page tiles on screen. */
+- (void)applyNightMode {
+    RNPDFSetNightModeEnabled(_pdfDocument, _nightMode);
+    RCTLogInfo(@"🌙 [iOS Night] nightMode=%d applied", _nightMode);
+    PGDBG(@"night:applyNightMode nightMode=%d paged=%d", _nightMode, _currentUsePageViewController);
+    [self applyNightModeChrome];
+    [self applyNightPaperToPageViewsInView:_pdfView depth:0];
+    [_pdfView layoutDocumentView];
+    [_pdfView setNeedsDisplay];
+    [_pdfView.documentView setNeedsDisplay];
 }
 
 /** Returns the PDFKit content view that actually zooms, so highlights scale/pan with the page instead of floating above it. */
@@ -2423,6 +2729,22 @@ using namespace facebook::react;
         return;
     }
 
+    if (depth == 0) {
+        [self applyNightModeChrome];
+    } else if ([NSStringFromClass([view class]) containsString:@"PDFPageView"]) {
+        // The page itself. Its content arrives asynchronously (PDFKit renders tiles off the
+        // main thread), and only that content goes through RNPDFNightPage's inversion — so
+        // in night mode the area of a page whose tiles haven't landed yet showed as white
+        // paper for ~75-250ms after the page scrolled/turned into view, the "white flash
+        // then dark" reported 2026-10-02. Painting the page view itself the colour the
+        // inverted page ends up as means that gap reads as the finished page.
+        [self applyNightPaperToPageView:view];
+    } else {
+        // See -applyNightModeChrome: these are the containers whose opaque system
+        // background paints over PDFView's.
+        view.backgroundColor = [UIColor clearColor];
+    }
+
     if ([view isKindOfClass:[UIScrollView class]]) {
         UIScrollView *scrollView = (UIScrollView *)view;
         [self hookScrollViewDelegateIfNeeded:scrollView];
@@ -2686,6 +3008,7 @@ using namespace facebook::react;
     objc_setAssociatedObject(pageScrollView, kRNPDFPagingCarryTokenKey, @(_pagingCarryToken), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     PGDBG(@"paging:Page turn started on page %d: scale=%.3f fracX=%.3f",
                _pagingCarryFromPage, _pagingCarryRatio, _pagingCarryFracX);
+    [self applyNightPaperToPageViewsInView:_pdfView depth:0];
 }
 
 // Gives a page scroller the carried zoom: same scale and horizontal position as the page
@@ -2746,6 +3069,7 @@ using namespace facebook::react;
         _pagingCarryIncomingScrollView = candidate;
         _pagingCarryIncomingFromBelow = incomingFromBelow;
         [self applyPagingZoomCarryToScrollView:candidate showTopEdge:incomingFromBelow reason:@"incoming"];
+        [self applyNightPaperToPageViewsInView:_pdfView depth:0];
     }
 }
 
@@ -2852,6 +3176,7 @@ using namespace facebook::react;
     if (_highlightOverlay) {
         [self refreshHighlightOverlayContainer];
     }
+    [self applyNightPaperToPageViewsInView:_pdfView depth:0];
     if (_pagingCarryValid && _currentUsePageViewController &&
         _pageTransitionState != RNPDFPageTransitionIdle && [self isPageTurnScrollView:scrollView]) {
         [self applyPagingZoomCarryToIncomingPages];
@@ -3206,6 +3531,7 @@ using namespace facebook::react;
     if (_highlightOverlay) {
         [self refreshHighlightOverlayContainer];
     }
+    [self applyNightPaperToPageViewsInView:_pdfView depth:0];
     if (_fixScaleFactor <= 0) {
         return;
     }
